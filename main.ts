@@ -7,6 +7,7 @@ import {
     TFile,
     Notice,
 } from "obsidian";
+
 import {
     Extension,
     StateField,

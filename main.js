@@ -102,7 +102,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "color", "#" + Math.floor(Math.random() * 16777215).toString(16));
     __publicField(this, "statusBarItem");
     __publicField(this, "isRequestingFullSync", false);
-    // ВРЕМЯ ПОСЛЕДНЕГО ЛОКАЛЬНОГО ВВОДА (ДЛЯ РЕШЕНИЯ КОНФЛИКТОВ)
     __publicField(this, "lastLocalChangeTime", 0);
   }
   async onload() {
@@ -229,7 +228,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     this.isRequestingFullSync = false;
     this.updateStatusBar("connecting");
     const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
-    const url = `${baseUrl}/ws/${encodeURIComponent(fileId)}/${encodeURIComponent(this.activeClientId)}`;
+    const url = `${baseUrl}/ws?file_id=${encodeURIComponent(fileId)}&client_id=${encodeURIComponent(this.activeClientId)}`;
     try {
       this.socket = new WebSocket(url);
       this.socket.onopen = () => {
@@ -313,6 +312,9 @@ var SyncPlugin = class extends import_obsidian.Plugin {
               cm.state.doc.toString()
             );
             const serverVer = Number(data.version || 0);
+            console.log(
+              `CyberSync: Applying Full Sync v${serverVer}`
+            );
             if (serverContent === localContent) {
               await this.updateLocalVersion(file.path, serverVer);
             } else if (serverContent.trimEnd() === localContent.trimEnd()) {

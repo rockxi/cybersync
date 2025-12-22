@@ -123,7 +123,6 @@ export default class SyncPlugin extends Plugin {
     statusBarItem: HTMLElement;
 
     private isRequestingFullSync = false;
-    // ВРЕМЯ ПОСЛЕДНЕГО ЛОКАЛЬНОГО ВВОДА (ДЛЯ РЕШЕНИЯ КОНФЛИКТОВ)
     private lastLocalChangeTime = 0;
 
     async onload() {
@@ -150,9 +149,7 @@ export default class SyncPlugin extends Plugin {
                 }
 
                 if (update.docChanged) {
-                    // Фиксируем время активности пользователя
                     pluginInstance.lastLocalChangeTime = Date.now();
-
                     pluginInstance.socket.send(
                         JSON.stringify({
                             type: "text_change",
@@ -283,7 +280,9 @@ export default class SyncPlugin extends Plugin {
         this.updateStatusBar("connecting");
 
         const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
-        const url = `${baseUrl}/ws/${encodeURIComponent(fileId)}/${encodeURIComponent(this.activeClientId)}`;
+
+        // Query Params для исправления 403 Forbidden на кириллице
+        const url = `${baseUrl}/ws?file_id=${encodeURIComponent(fileId)}&client_id=${encodeURIComponent(this.activeClientId)}`;
 
         try {
             this.socket = new WebSocket(url);
@@ -365,6 +364,7 @@ export default class SyncPlugin extends Plugin {
                     const ver = Number(data.version || 0);
                     if (ver) {
                         await this.updateLocalVersion(file.path, ver);
+                        // Нормализуем \r\n -> \n перед отправкой
                         const content = this.normalizeText(
                             cm.state.doc.toString(),
                         );
@@ -391,12 +391,13 @@ export default class SyncPlugin extends Plugin {
                         );
                         const serverVer = Number(data.version || 0);
 
-                        // 1. Идеальное совпадение
+                        console.log(
+                            `CyberSync: Applying Full Sync v${serverVer}`,
+                        );
+
                         if (serverContent === localContent) {
                             await this.updateLocalVersion(file.path, serverVer);
-                        }
-                        // 2. Незначительные отличия (пробелы)
-                        else if (
+                        } else if (
                             serverContent.trimEnd() === localContent.trimEnd()
                         ) {
                             cm.dispatch({
@@ -409,23 +410,17 @@ export default class SyncPlugin extends Plugin {
                                 annotations: [RemoteUpdate.of(true)],
                             });
                             await this.updateLocalVersion(file.path, serverVer);
-                        }
-                        // 3. КОНФЛИКТЫ
-                        else {
-                            // --- ГЛАВНОЕ ИСПРАВЛЕНИЕ ---
-                            // Если пользователь на этом устройстве НЕ печатал последние 3 секунды,
-                            // мы считаем, что он в режиме "Наблюдателя".
-                            // Значит, любые отличия - это просто отставание, а не конфликт.
-                            // Мы просто принимаем версию сервера.
+                        } else {
                             const timeSinceEdit =
                                 Date.now() - this.lastLocalChangeTime;
-                            const isUserIdle = timeSinceEdit > 3000; // 3 секунды тишины
+                            const isUserIdle = timeSinceEdit > 3000;
 
                             const serverHasMarkers =
                                 this.hasConflictMarkers(serverContent);
                             const localHasMarkers =
                                 this.hasConflictMarkers(localContent);
 
+                            // Если юзер молчал или это удаленный резолв -> принимаем
                             if (
                                 isUserIdle ||
                                 (!serverHasMarkers && localHasMarkers)
@@ -447,7 +442,6 @@ export default class SyncPlugin extends Plugin {
                                     serverVer,
                                 );
                             } else {
-                                // Юзер активно печатал и тексты разные -> РЕАЛЬНЫЙ конфликт
                                 const conflictText = `<<<<<<< REMOTE (Server v${serverVer})
 ${serverContent}
 =======

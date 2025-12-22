@@ -37,11 +37,10 @@ const DEFAULT_SETTINGS: CyberSyncSettings = {
     fileVersions: {},
 };
 
-// --- АННОТАЦИЯ ДЛЯ ОТЛИЧИЯ УДАЛЕННЫХ ИЗМЕНЕНИЙ ---
-// Если транзакция помечена этим, значит она пришла с сервера
+// Аннотация для отличия серверных изменений (чтобы не слать эхо)
 const RemoteUpdate = Annotation.define<boolean>();
 
-// --- ТИПЫ ДАННЫХ ДЛЯ КУРСОРА ---
+// --- ТИПЫ ДАННЫХ ---
 interface CursorPosition {
     pos: number;
     clientId: string;
@@ -125,51 +124,45 @@ export default class SyncPlugin extends Plugin {
                 if (pluginInstance.socket?.readyState !== WebSocket.OPEN)
                     return;
 
-                // --- ГЛАВНАЯ ЗАЩИТА ОТ ЦИКЛОВ ---
-                // Проверяем: есть ли в транзакции наша метка RemoteUpdate?
-                const isRemote = update.transactions.some((tr) =>
-                    tr.annotation(RemoteUpdate),
-                );
-                if (isRemote) {
-                    // Это изменение пришло из сокета (мы сами его применили).
-                    // НЕ ОТПРАВЛЯЕМ ЕГО ОБРАТНО!
+                // Если это изменение пришло с сервера (аннотация), игнорируем
+                if (
+                    update.transactions.some((tr) =>
+                        tr.annotation(RemoteUpdate),
+                    )
+                ) {
                     return;
                 }
 
                 if (update.docChanged) {
-                    // Дополнительная проверка на UserEvent для надежности,
-                    // но RemoteUpdate важнее.
-                    const isUserAction = update.transactions.some(
-                        (tr) =>
-                            tr.isUserEvent("input") ||
-                            tr.isUserEvent("delete") ||
-                            tr.isUserEvent("undo") ||
-                            tr.isUserEvent("redo") ||
-                            // Разрешаем "unknown", если это не RemoteUpdate (иногда paste/drag так работают)
-                            !tr.annotation(RemoteUpdate),
+                    // Разрешаем отправку, если это не RemoteUpdate.
+                    // Даже если isUserEvent false (иногда paste/drag так работают), нам надо это синкать.
+                    // Главный фильтр - это RemoteUpdate.
+                    pluginInstance.socket.send(
+                        JSON.stringify({
+                            type: "text_change",
+                            changes: update.changes.toJSON(),
+                            clientId: pluginInstance.activeClientId,
+                        }),
                     );
+                }
 
-                    if (isUserAction) {
+                if (update.selectionSet) {
+                    // Курсоры тоже не шлем, если это результат удаленной вставки
+                    if (
+                        !update.transactions.some((tr) =>
+                            tr.annotation(RemoteUpdate),
+                        )
+                    ) {
+                        const pos = update.state.selection.main.head;
                         pluginInstance.socket.send(
                             JSON.stringify({
-                                type: "text_change",
-                                changes: update.changes.toJSON(),
+                                type: "cursor",
+                                pos: pos,
+                                color: pluginInstance.color,
                                 clientId: pluginInstance.activeClientId,
                             }),
                         );
                     }
-                }
-
-                if (update.selectionSet && !isRemote) {
-                    const pos = update.state.selection.main.head;
-                    pluginInstance.socket.send(
-                        JSON.stringify({
-                            type: "cursor",
-                            pos: pos,
-                            color: pluginInstance.color,
-                            clientId: pluginInstance.activeClientId,
-                        }),
-                    );
                 }
             },
         );
@@ -257,6 +250,11 @@ export default class SyncPlugin extends Plugin {
         await this.saveData(this.settings);
     }
 
+    // Хелпер для проверки наличия маркеров конфликта
+    hasConflictMarkers(text: string): boolean {
+        return /^<<<<<<< REMOTE \(Server v\d+\)/m.test(text);
+    }
+
     connectSocket(fileId: string) {
         if (this.socket) {
             this.socket.close();
@@ -329,7 +327,6 @@ export default class SyncPlugin extends Plugin {
                             return;
                         }
 
-                        // ВАЖНО: Добавляем аннотацию RemoteUpdate!
                         cm.dispatch({
                             changes: changes,
                             scrollIntoView: !data.is_history,
@@ -354,7 +351,6 @@ export default class SyncPlugin extends Plugin {
                     const ver = Number(data.version || 0);
                     if (ver) {
                         await this.updateLocalVersion(file.path, ver);
-                        // Отправляем хинт только если это была наша правка
                         const content = cm.state.doc.toString();
                         this.socket?.send(
                             JSON.stringify({
@@ -383,28 +379,63 @@ export default class SyncPlugin extends Plugin {
                             await this.updateLocalVersion(file.path, serverVer);
                             console.log("CyberSync: Full sync matched.");
                         } else {
-                            const conflictText = `<<<<<<< REMOTE (Server v${serverVer})
+                            // ЛОГИКА АВТО-РЕЗОЛВА:
+                            // Если серверный текст "чистый" (без маркеров),
+                            // а у нас локально есть маркеры (мы в состоянии конфликта),
+                            // значит серверная версия - это РЕШЕНИЕ конфликта.
+                            // Мы должны принять её целиком, не создавая вложенных конфликтов.
+
+                            const serverHasMarkers =
+                                this.hasConflictMarkers(serverContent);
+                            const localHasMarkers =
+                                this.hasConflictMarkers(localContent);
+
+                            if (!serverHasMarkers && localHasMarkers) {
+                                console.log(
+                                    "CyberSync: Detected resolution from server. Overwriting local conflicts.",
+                                );
+                                cm.dispatch({
+                                    changes: {
+                                        from: 0,
+                                        to: localContent.length,
+                                        insert: serverContent, // Просто заменяем
+                                    },
+                                    scrollIntoView: false,
+                                    annotations: [RemoteUpdate.of(true)],
+                                });
+                                await this.updateLocalVersion(
+                                    file.path,
+                                    serverVer,
+                                );
+                                new Notice(
+                                    "CyberSync: Conflict resolved remotely.",
+                                );
+                            } else {
+                                // Иначе - стандартная логика конфликтов (оборачиваем)
+                                const conflictText = `<<<<<<< REMOTE (Server v${serverVer})
 ${serverContent}
 =======
 ${localContent}
 >>>>>>> LOCAL (My changes)
 `;
-                            // ВАЖНО: Аннотация RemoteUpdate!
-                            // Мы меняем текст, но это НЕ должно триггерить отправку на сервер
-                            cm.dispatch({
-                                changes: {
-                                    from: 0,
-                                    to: localContent.length,
-                                    insert: conflictText,
-                                },
-                                scrollIntoView: false,
-                                annotations: [RemoteUpdate.of(true)],
-                            });
+                                cm.dispatch({
+                                    changes: {
+                                        from: 0,
+                                        to: localContent.length,
+                                        insert: conflictText,
+                                    },
+                                    scrollIntoView: false,
+                                    annotations: [RemoteUpdate.of(true)],
+                                });
 
-                            await this.updateLocalVersion(file.path, serverVer);
-                            new Notice(
-                                "CyberSync: Conflict merged. Resolve manually.",
-                            );
+                                await this.updateLocalVersion(
+                                    file.path,
+                                    serverVer,
+                                );
+                                new Notice(
+                                    "CyberSync: Conflict detected. Resolve manually.",
+                                );
+                            }
                         }
                     } catch (e) {
                         console.error("Full sync failed", e);
@@ -413,7 +444,6 @@ ${localContent}
                     }
                 } else if (data.type === "cursor") {
                     if (data.clientId === this.activeClientId) return;
-                    // Курсоры тоже метим, на всякий случай
                     cm.dispatch({
                         effects: updateCursorEffect.of({
                             pos: data.pos,

@@ -102,37 +102,34 @@ var SyncPlugin = class extends import_obsidian.Plugin {
         var _a;
         if (((_a = pluginInstance.socket) == null ? void 0 : _a.readyState) !== WebSocket.OPEN)
           return;
-        const isRemote = update.transactions.some(
+        if (update.transactions.some(
           (tr) => tr.annotation(RemoteUpdate)
-        );
-        if (isRemote) {
+        )) {
           return;
         }
         if (update.docChanged) {
-          const isUserAction = update.transactions.some(
-            (tr) => tr.isUserEvent("input") || tr.isUserEvent("delete") || tr.isUserEvent("undo") || tr.isUserEvent("redo") || // Разрешаем "unknown", если это не RemoteUpdate (иногда paste/drag так работают)
-            !tr.annotation(RemoteUpdate)
+          pluginInstance.socket.send(
+            JSON.stringify({
+              type: "text_change",
+              changes: update.changes.toJSON(),
+              clientId: pluginInstance.activeClientId
+            })
           );
-          if (isUserAction) {
+        }
+        if (update.selectionSet) {
+          if (!update.transactions.some(
+            (tr) => tr.annotation(RemoteUpdate)
+          )) {
+            const pos = update.state.selection.main.head;
             pluginInstance.socket.send(
               JSON.stringify({
-                type: "text_change",
-                changes: update.changes.toJSON(),
+                type: "cursor",
+                pos,
+                color: pluginInstance.color,
                 clientId: pluginInstance.activeClientId
               })
             );
           }
-        }
-        if (update.selectionSet && !isRemote) {
-          const pos = update.state.selection.main.head;
-          pluginInstance.socket.send(
-            JSON.stringify({
-              type: "cursor",
-              pos,
-              color: pluginInstance.color,
-              clientId: pluginInstance.activeClientId
-            })
-          );
         }
       }
     );
@@ -202,6 +199,10 @@ var SyncPlugin = class extends import_obsidian.Plugin {
   }
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+  // Хелпер для проверки наличия маркеров конфликта
+  hasConflictMarkers(text) {
+    return /^<<<<<<< REMOTE \(Server v\d+\)/m.test(text);
   }
   connectSocket(fileId) {
     if (this.socket) {
@@ -300,25 +301,53 @@ var SyncPlugin = class extends import_obsidian.Plugin {
               await this.updateLocalVersion(file.path, serverVer);
               console.log("CyberSync: Full sync matched.");
             } else {
-              const conflictText = `<<<<<<< REMOTE (Server v${serverVer})
+              const serverHasMarkers = this.hasConflictMarkers(serverContent);
+              const localHasMarkers = this.hasConflictMarkers(localContent);
+              if (!serverHasMarkers && localHasMarkers) {
+                console.log(
+                  "CyberSync: Detected resolution from server. Overwriting local conflicts."
+                );
+                cm.dispatch({
+                  changes: {
+                    from: 0,
+                    to: localContent.length,
+                    insert: serverContent
+                    // Просто заменяем
+                  },
+                  scrollIntoView: false,
+                  annotations: [RemoteUpdate.of(true)]
+                });
+                await this.updateLocalVersion(
+                  file.path,
+                  serverVer
+                );
+                new import_obsidian.Notice(
+                  "CyberSync: Conflict resolved remotely."
+                );
+              } else {
+                const conflictText = `<<<<<<< REMOTE (Server v${serverVer})
 ${serverContent}
 =======
 ${localContent}
 >>>>>>> LOCAL (My changes)
 `;
-              cm.dispatch({
-                changes: {
-                  from: 0,
-                  to: localContent.length,
-                  insert: conflictText
-                },
-                scrollIntoView: false,
-                annotations: [RemoteUpdate.of(true)]
-              });
-              await this.updateLocalVersion(file.path, serverVer);
-              new import_obsidian.Notice(
-                "CyberSync: Conflict merged. Resolve manually."
-              );
+                cm.dispatch({
+                  changes: {
+                    from: 0,
+                    to: localContent.length,
+                    insert: conflictText
+                  },
+                  scrollIntoView: false,
+                  annotations: [RemoteUpdate.of(true)]
+                });
+                await this.updateLocalVersion(
+                  file.path,
+                  serverVer
+                );
+                new import_obsidian.Notice(
+                  "CyberSync: Conflict detected. Resolve manually."
+                );
+              }
             }
           } catch (e) {
             console.error("Full sync failed", e);

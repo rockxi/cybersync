@@ -27,6 +27,9 @@ module.exports = __toCommonJS(main_exports);
 var import_obsidian = require("obsidian");
 var import_state = require("@codemirror/state");
 var import_view = require("@codemirror/view");
+var DEFAULT_SETTINGS = {
+  serverUrl: "ws://localhost:8000"
+};
 var updateCursorEffect = import_state.StateEffect.define();
 var removeCursorEffect = import_state.StateEffect.define();
 var CursorWidget = class extends import_view.WidgetType {
@@ -81,58 +84,109 @@ var cursorField = import_state.StateField.define({
 var SyncPlugin = class extends import_obsidian.Plugin {
   constructor() {
     super(...arguments);
+    __publicField(this, "settings");
     __publicField(this, "socket", null);
     __publicField(this, "clientId", "User_" + Math.floor(Math.random() * 1e3));
     __publicField(this, "color", "#" + Math.floor(Math.random() * 16777215).toString(16));
   }
   async onload() {
-    const socketListener = import_view.ViewPlugin.fromClass(class {
-      constructor(view) {
-        this.view = view;
-      }
-      update(update) {
-        var _a;
-        if (update.selectionSet && ((_a = pluginInstance.socket) == null ? void 0 : _a.readyState) === WebSocket.OPEN) {
-          const pos = update.state.selection.main.head;
-          pluginInstance.socket.send(JSON.stringify({
-            type: "cursor",
-            pos,
-            color: pluginInstance.color
-          }));
+    await this.loadSettings();
+    this.addSettingTab(new CyberSyncSettingTab(this.app, this));
+    const socketListener = import_view.ViewPlugin.fromClass(
+      class {
+        constructor(view) {
+          this.view = view;
+        }
+        update(update) {
+          var _a;
+          if (update.selectionSet && ((_a = pluginInstance.socket) == null ? void 0 : _a.readyState) === WebSocket.OPEN) {
+            const pos = update.state.selection.main.head;
+            pluginInstance.socket.send(
+              JSON.stringify({
+                type: "cursor",
+                pos,
+                color: pluginInstance.color
+              })
+            );
+          }
         }
       }
-    });
+    );
     const pluginInstance = this;
     this.registerEditorExtension([cursorField, socketListener]);
     this.app.workspace.on("file-open", (file) => {
       if (file) this.connectSocket(file.path);
     });
+    const activeFile = this.app.workspace.getActiveFile();
+    if (activeFile) {
+      this.connectSocket(activeFile.path);
+    }
+  }
+  async loadSettings() {
+    this.settings = Object.assign(
+      {},
+      DEFAULT_SETTINGS,
+      await this.loadData()
+    );
+  }
+  async saveSettings() {
+    await this.saveData(this.settings);
+    const activeFile = this.app.workspace.getActiveFile();
+    if (activeFile) {
+      this.connectSocket(activeFile.path);
+    }
   }
   connectSocket(fileId) {
     if (this.socket) this.socket.close();
+    const serverUrl = this.settings.serverUrl.replace(/\/$/, "");
     const encodedId = encodeURIComponent(fileId);
-    this.socket = new WebSocket(`ws://localhost:8000/ws/${encodedId}/${this.clientId}`);
-    this.socket.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
-      if (!view) return;
-      if (data.clientId === this.clientId) return;
-      if (data.type === "cursor") {
-        view.editor.cm.dispatch({
-          effects: updateCursorEffect.of({
-            pos: data.pos,
-            clientId: data.clientId,
-            color: data.color
-          })
-        });
-      } else if (data.type === "disconnect") {
-        view.editor.cm.dispatch({
-          effects: removeCursorEffect.of(data.clientId)
-        });
-      }
-    };
+    const url = `${serverUrl}/ws/${this.clientId}/${fileId}`;
+    console.log("Connecting to:", url);
+    try {
+      this.socket = new WebSocket(url);
+      this.socket.onopen = () => console.log("CyberSync connected");
+      this.socket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+        if (!view) return;
+        if (data.clientId === this.clientId) return;
+        if (data.type === "cursor") {
+          view.editor.cm.dispatch({
+            effects: updateCursorEffect.of({
+              pos: data.pos,
+              clientId: data.clientId,
+              color: data.color
+            })
+          });
+        } else if (data.type === "disconnect") {
+          view.editor.cm.dispatch({
+            effects: removeCursorEffect.of(data.clientId)
+          });
+        }
+      };
+    } catch (e) {
+      console.error("Connection error:", e);
+    }
   }
   onunload() {
     if (this.socket) this.socket.close();
+  }
+};
+var CyberSyncSettingTab = class extends import_obsidian.PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    __publicField(this, "plugin");
+    this.plugin = plugin;
+  }
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    containerEl.createEl("h2", { text: "CyberSync Settings" });
+    new import_obsidian.Setting(containerEl).setName("Server URL").setDesc("WebSocket server address (e.g. ws://192.168.1.5:8000)").addText(
+      (text) => text.setPlaceholder("ws://localhost:8000").setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
+        this.plugin.settings.serverUrl = value;
+        await this.plugin.saveSettings();
+      })
+    );
   }
 };

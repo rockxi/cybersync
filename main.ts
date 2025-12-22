@@ -1,8 +1,24 @@
-import { Plugin, MarkdownView } from 'obsidian';
-import { Extension, StateField, StateEffect } from '@codemirror/state';
-import { EditorView, Decoration, DecorationSet, ViewPlugin, ViewUpdate, WidgetType } from '@codemirror/view';
+import { App, Plugin, PluginSettingTab, Setting, MarkdownView } from "obsidian";
+import { Extension, StateField, StateEffect } from "@codemirror/state";
+import {
+    EditorView,
+    Decoration,
+    DecorationSet,
+    ViewPlugin,
+    ViewUpdate,
+    WidgetType,
+} from "@codemirror/view";
 
-// --- ТИПЫ ---
+// --- НАСТРОЙКИ ---
+interface CyberSyncSettings {
+    serverUrl: string;
+}
+
+const DEFAULT_SETTINGS: CyberSyncSettings = {
+    serverUrl: "ws://localhost:8000",
+};
+
+// --- ТИПЫ ДАННЫХ ---
 interface CursorPosition {
     pos: number;
     clientId: string;
@@ -15,7 +31,12 @@ const removeCursorEffect = StateEffect.define<string>();
 
 // --- ВИДЖЕТ ---
 class CursorWidget extends WidgetType {
-    constructor(readonly color: string, readonly label: string) { super(); }
+    constructor(
+        readonly color: string,
+        readonly label: string,
+    ) {
+        super();
+    }
     toDOM() {
         const wrap = document.createElement("span");
         wrap.className = "remote-cursor";
@@ -31,100 +52,203 @@ class CursorWidget extends WidgetType {
 
 // --- STATE FIELD ---
 const cursorField = StateField.define<DecorationSet>({
-    create() { return Decoration.none; },
+    create() {
+        return Decoration.none;
+    },
     update(cursors, tr) {
         cursors = cursors.map(tr.changes);
         for (let e of tr.effects) {
             if (e.is(updateCursorEffect)) {
                 const deco = Decoration.widget({
                     widget: new CursorWidget(e.value.color, e.value.clientId),
-                    side: 0
+                    side: 0,
                 }).range(e.value.pos);
                 cursors = cursors.update({
                     filter: (from, to, value) => {
-                         // @ts-ignore
-                        return value.widget.label !== e.value.clientId; 
+                        // @ts-ignore
+                        return value.widget.label !== e.value.clientId;
                     },
-                    add: [deco]
+                    add: [deco],
                 });
             }
             if (e.is(removeCursorEffect)) {
-                 cursors = cursors.update({
+                cursors = cursors.update({
                     filter: (from, to, value) => {
-                         // @ts-ignore
+                        // @ts-ignore
                         return value.widget.label !== e.value;
-                    }
+                    },
                 });
             }
         }
         return cursors;
     },
-    provide: (f) => EditorView.decorations.from(f)
+    provide: (f) => EditorView.decorations.from(f),
 });
 
-// --- ПЛАГИН ---
+// --- ГЛАВНЫЙ КЛАСС ПЛАГИНА ---
 export default class SyncPlugin extends Plugin {
+    settings: CyberSyncSettings;
     socket: WebSocket | null = null;
     clientId: string = "User_" + Math.floor(Math.random() * 1000);
-    color: string = '#' + Math.floor(Math.random()*16777215).toString(16);
+    color: string = "#" + Math.floor(Math.random() * 16777215).toString(16);
 
     async onload() {
-        // Создаем ViewPlugin внутри onload, чтобы иметь доступ к `this` (экземпляру плагина)
-        const socketListener = ViewPlugin.fromClass(class {
-            constructor(public view: EditorView) {}
-            update(update: ViewUpdate) {
-                // Обращаемся к this плагина через замыкание (pluginInstance)
-                if (update.selectionSet && pluginInstance.socket?.readyState === WebSocket.OPEN) {
-                    const pos = update.state.selection.main.head;
-                    pluginInstance.socket.send(JSON.stringify({
-                        type: "cursor",
-                        pos: pos,
-                        color: pluginInstance.color
-                    }));
+        // 1. Загружаем настройки
+        await this.loadSettings();
+
+        // 2. Добавляем вкладку настроек
+        this.addSettingTab(new CyberSyncSettingTab(this.app, this));
+
+        // 3. Логика ViewPlugin (как в твоем рабочем коде)
+        const socketListener = ViewPlugin.fromClass(
+            class {
+                constructor(public view: EditorView) {}
+                update(update: ViewUpdate) {
+                    // pluginInstance доступен через замыкание ниже
+                    if (
+                        update.selectionSet &&
+                        pluginInstance.socket?.readyState === WebSocket.OPEN
+                    ) {
+                        const pos = update.state.selection.main.head;
+                        pluginInstance.socket.send(
+                            JSON.stringify({
+                                type: "cursor",
+                                pos: pos,
+                                color: pluginInstance.color,
+                            }),
+                        );
+                    }
                 }
-            }
-        });
+            },
+        );
 
-        const pluginInstance = this; // Сохраняем ссылку на плагин
-
+        const pluginInstance = this;
         this.registerEditorExtension([cursorField, socketListener]);
 
-        this.app.workspace.on('file-open', (file) => {
+        this.app.workspace.on("file-open", (file) => {
             if (file) this.connectSocket(file.path);
         });
+
+        // Если файл уже открыт при старте
+        const activeFile = this.app.workspace.getActiveFile();
+        if (activeFile) {
+            this.connectSocket(activeFile.path);
+        }
+    }
+
+    async loadSettings() {
+        this.settings = Object.assign(
+            {},
+            DEFAULT_SETTINGS,
+            await this.loadData(),
+        );
+    }
+
+    async saveSettings() {
+        await this.saveData(this.settings);
+        // Переподключаемся при сохранении настроек, если есть активный файл
+        const activeFile = this.app.workspace.getActiveFile();
+        if (activeFile) {
+            this.connectSocket(activeFile.path);
+        }
     }
 
     connectSocket(fileId: string) {
         if (this.socket) this.socket.close();
+
+        // --- ИСПОЛЬЗУЕМ URL ИЗ НАСТРОЕК ---
+        // Убираем trailing slash если пользователь случайно добавил
+        const serverUrl = this.settings.serverUrl.replace(/\/$/, "");
+
+        // ВАЖНО: Мы меняем структуру URL, чтобы она работала с Python сервером
+        // Старый (твой рабочий): `ws://localhost:8000/ws/${encodedId}/${this.clientId}`
+        // Новый (с настройкой): `${serverUrl}/ws/${this.clientId}/${fileId}`
+
+        // Если ты хочешь оставить ТОЧНО КАК БЫЛО, но с настройкой хоста:
         const encodedId = encodeURIComponent(fileId);
-        // Убедись, что порт совпадает с сервером (8000)
-        this.socket = new WebSocket(`ws://localhost:8000/ws/${encodedId}/${this.clientId}`);
+        // Мы берем из настроек ws://localhost:8000 и добавляем путь
+        // Но лучше использовать формат serverUrl/ws/...
 
-        this.socket.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-            if (!view) return;
+        // Вариант 1: Сохраняем твою логику (encodedId в середине), но берем хост из настроек
+        // Это предполагает, что serverUrl = "ws://localhost:8000"
 
-            // Не рисуем свой же курсор, если он прилетел обратно (хотя сервер фильтрует, но на всякий)
-            if (data.clientId === this.clientId) return;
+        // Используем новую схему роутинга {client_id}/{file_path}, которую мы обсуждали для фикса 403
+        // или старую, если ты уверен, что она работает.
 
-            if (data.type === "cursor") {
-                view.editor.cm.dispatch({
-                    effects: updateCursorEffect.of({
-                        pos: data.pos,
-                        clientId: data.clientId,
-                        color: data.color
-                    })
-                });
-            } else if (data.type === "disconnect") {
-                view.editor.cm.dispatch({
-                    effects: removeCursorEffect.of(data.clientId)
-                });
-            }
-        };
+        // Давай сделаем универсально, предполагая, что ты пофиксил роутер на сервере (как мы обсуждали):
+        // ws://host:port/ws/{client_id}/{file_path}
+        // (без encodeURIComponent для всего пути, чтобы слеши работали)
+
+        const url = `${serverUrl}/ws/${this.clientId}/${fileId}`;
+
+        // ЕСЛИ у тебя старый сервер (где encodedId), используй это:
+        // const url = `${serverUrl}/ws/${encodeURIComponent(fileId)}/${this.clientId}`;
+
+        console.log("Connecting to:", url);
+
+        try {
+            this.socket = new WebSocket(url);
+
+            this.socket.onopen = () => console.log("CyberSync connected");
+
+            this.socket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                const view =
+                    this.app.workspace.getActiveViewOfType(MarkdownView);
+                if (!view) return;
+
+                if (data.clientId === this.clientId) return;
+
+                if (data.type === "cursor") {
+                    view.editor.cm.dispatch({
+                        effects: updateCursorEffect.of({
+                            pos: data.pos,
+                            clientId: data.clientId,
+                            color: data.color,
+                        }),
+                    });
+                } else if (data.type === "disconnect") {
+                    view.editor.cm.dispatch({
+                        effects: removeCursorEffect.of(data.clientId),
+                    });
+                }
+            };
+        } catch (e) {
+            console.error("Connection error:", e);
+        }
     }
 
     onunload() {
         if (this.socket) this.socket.close();
+    }
+}
+
+// --- UI НАСТРОЕК ---
+class CyberSyncSettingTab extends PluginSettingTab {
+    plugin: SyncPlugin;
+
+    constructor(app: App, plugin: SyncPlugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
+
+    display(): void {
+        const { containerEl } = this;
+        containerEl.empty();
+
+        containerEl.createEl("h2", { text: "CyberSync Settings" });
+
+        new Setting(containerEl)
+            .setName("Server URL")
+            .setDesc("WebSocket server address (e.g. ws://192.168.1.5:8000)")
+            .addText((text) =>
+                text
+                    .setPlaceholder("ws://localhost:8000")
+                    .setValue(this.plugin.settings.serverUrl)
+                    .onChange(async (value) => {
+                        this.plugin.settings.serverUrl = value;
+                        await this.plugin.saveSettings();
+                    }),
+            );
     }
 }

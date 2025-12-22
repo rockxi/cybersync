@@ -37,7 +37,6 @@ const DEFAULT_SETTINGS: CyberSyncSettings = {
     fileVersions: {},
 };
 
-// Аннотация для отличия серверных изменений (чтобы не слать эхо)
 const RemoteUpdate = Annotation.define<boolean>();
 
 // --- ТИПЫ ДАННЫХ ---
@@ -70,18 +69,32 @@ class CursorWidget extends WidgetType {
     }
 }
 
+// --- ИСПРАВЛЕННЫЙ CURSOR FIELD ---
 const cursorField = StateField.define<DecorationSet>({
     create() {
         return Decoration.none;
     },
     update(cursors, tr) {
-        cursors = cursors.map(tr.changes);
+        // ЗАЩИТА ОТ КРАША ПРИ FULL SYNC
+        try {
+            cursors = cursors.map(tr.changes);
+        } catch (e) {
+            // Если документ изменился настолько радикально (Full Sync),
+            // что маппинг ломается - просто сбрасываем курсоры.
+            // Это лучше, чем краш всего плагина.
+            return Decoration.none;
+        }
+
         for (let e of tr.effects) {
             if (e.is(updateCursorEffect)) {
+                // Еще одна защита: проверяем, что позиция курсора валидна для текущего документа
+                if (e.value.pos > tr.newDoc.length) continue;
+
                 const deco = Decoration.widget({
                     widget: new CursorWidget(e.value.color, e.value.clientId),
                     side: 0,
                 }).range(e.value.pos);
+
                 cursors = cursors.update({
                     filter: (from, to, value) =>
                         (value.widget as any).label !== e.value.clientId,
@@ -124,7 +137,6 @@ export default class SyncPlugin extends Plugin {
                 if (pluginInstance.socket?.readyState !== WebSocket.OPEN)
                     return;
 
-                // Если это изменение пришло с сервера (аннотация), игнорируем
                 if (
                     update.transactions.some((tr) =>
                         tr.annotation(RemoteUpdate),
@@ -134,9 +146,6 @@ export default class SyncPlugin extends Plugin {
                 }
 
                 if (update.docChanged) {
-                    // Разрешаем отправку, если это не RemoteUpdate.
-                    // Даже если isUserEvent false (иногда paste/drag так работают), нам надо это синкать.
-                    // Главный фильтр - это RemoteUpdate.
                     pluginInstance.socket.send(
                         JSON.stringify({
                             type: "text_change",
@@ -147,7 +156,6 @@ export default class SyncPlugin extends Plugin {
                 }
 
                 if (update.selectionSet) {
-                    // Курсоры тоже не шлем, если это результат удаленной вставки
                     if (
                         !update.transactions.some((tr) =>
                             tr.annotation(RemoteUpdate),
@@ -250,7 +258,6 @@ export default class SyncPlugin extends Plugin {
         await this.saveData(this.settings);
     }
 
-    // Хелпер для проверки наличия маркеров конфликта
     hasConflictMarkers(text: string): boolean {
         return /^<<<<<<< REMOTE \(Server v\d+\)/m.test(text);
     }
@@ -379,12 +386,6 @@ export default class SyncPlugin extends Plugin {
                             await this.updateLocalVersion(file.path, serverVer);
                             console.log("CyberSync: Full sync matched.");
                         } else {
-                            // ЛОГИКА АВТО-РЕЗОЛВА:
-                            // Если серверный текст "чистый" (без маркеров),
-                            // а у нас локально есть маркеры (мы в состоянии конфликта),
-                            // значит серверная версия - это РЕШЕНИЕ конфликта.
-                            // Мы должны принять её целиком, не создавая вложенных конфликтов.
-
                             const serverHasMarkers =
                                 this.hasConflictMarkers(serverContent);
                             const localHasMarkers =
@@ -398,7 +399,7 @@ export default class SyncPlugin extends Plugin {
                                     changes: {
                                         from: 0,
                                         to: localContent.length,
-                                        insert: serverContent, // Просто заменяем
+                                        insert: serverContent,
                                     },
                                     scrollIntoView: false,
                                     annotations: [RemoteUpdate.of(true)],
@@ -411,7 +412,6 @@ export default class SyncPlugin extends Plugin {
                                     "CyberSync: Conflict resolved remotely.",
                                 );
                             } else {
-                                // Иначе - стандартная логика конфликтов (оборачиваем)
                                 const conflictText = `<<<<<<< REMOTE (Server v${serverVer})
 ${serverContent}
 =======

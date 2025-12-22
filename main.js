@@ -58,9 +58,14 @@ var cursorField = import_state.StateField.define({
     return import_view.Decoration.none;
   },
   update(cursors, tr) {
-    cursors = cursors.map(tr.changes);
+    try {
+      cursors = cursors.map(tr.changes);
+    } catch (e) {
+      return import_view.Decoration.none;
+    }
     for (let e of tr.effects) {
       if (e.is(updateCursorEffect)) {
+        if (e.value.pos > tr.newDoc.length) continue;
         const deco = import_view.Decoration.widget({
           widget: new CursorWidget(e.value.color, e.value.clientId),
           side: 0
@@ -200,7 +205,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
   }
-  // Хелпер для проверки наличия маркеров конфликта
   hasConflictMarkers(text) {
     return /^<<<<<<< REMOTE \(Server v\d+\)/m.test(text);
   }
@@ -312,7 +316,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
                     from: 0,
                     to: localContent.length,
                     insert: serverContent
-                    // Просто заменяем
                   },
                   scrollIntoView: false,
                   annotations: [RemoteUpdate.of(true)]

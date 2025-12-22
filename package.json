@@ -1,0 +1,23 @@
+{
+    "name": "cybersync",
+    "version": "1.0.0",
+    "description": "",
+    "main": "index.js",
+    "scripts": {
+        "test": "echo \"Error: no test specified\" && exit 1",
+        "build": "esbuild main.ts --bundle --platform=node --target=es2018 --outfile=main.js --external:obsidian --external:electron --external:@codemirror/* --format=cjs",
+        "dev": "esbuild main.ts --bundle --platform=node --target=es2018 --outfile=main.js --external:obsidian --external:electron --external:@codemirror/* --format=cjs --watch"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "dependencies": {
+        "@codemirror/state": "^6.5.0",
+        "@codemirror/view": "^6.38.6",
+        "obsidian": "^1.11.0"
+    },
+    "devDependencies": {
+        "esbuild": "^0.27.2",
+        "typescript": "^5.9.3"
+    }
+}

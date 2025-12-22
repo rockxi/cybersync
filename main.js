@@ -28,7 +28,9 @@ var import_obsidian = require("obsidian");
 var import_state = require("@codemirror/state");
 var import_view = require("@codemirror/view");
 var DEFAULT_SETTINGS = {
-  serverUrl: "ws://localhost:8000"
+  serverUrl: "ws://localhost:8000",
+  clientId: ""
+  // По умолчанию пусто, будет генерироваться случайно
 };
 var updateCursorEffect = import_state.StateEffect.define();
 var removeCursorEffect = import_state.StateEffect.define();
@@ -86,12 +88,15 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     super(...arguments);
     __publicField(this, "settings");
     __publicField(this, "socket", null);
-    __publicField(this, "clientId", "User_" + Math.floor(Math.random() * 1e3));
+    __publicField(this, "activeClientId");
+    // ID, который используется в текущей сессии
     __publicField(this, "color", "#" + Math.floor(Math.random() * 16777215).toString(16));
   }
   async onload() {
     await this.loadSettings();
+    this.updateActiveClientId();
     this.addSettingTab(new CyberSyncSettingTab(this.app, this));
+    const pluginInstance = this;
     const socketListener = import_view.ViewPlugin.fromClass(
       class {
         constructor(view) {
@@ -112,7 +117,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
         }
       }
     );
-    const pluginInstance = this;
     this.registerEditorExtension([cursorField, socketListener]);
     this.app.workspace.on("file-open", (file) => {
       if (file) this.connectSocket(file.path);
@@ -120,6 +124,13 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     const activeFile = this.app.workspace.getActiveFile();
     if (activeFile) {
       this.connectSocket(activeFile.path);
+    }
+  }
+  updateActiveClientId() {
+    if (this.settings.clientId && this.settings.clientId.trim() !== "") {
+      this.activeClientId = this.settings.clientId.trim();
+    } else {
+      this.activeClientId = "User_" + Math.floor(Math.random() * 1e3);
     }
   }
   async loadSettings() {
@@ -131,6 +142,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
   }
   async saveSettings() {
     await this.saveData(this.settings);
+    this.updateActiveClientId();
     const activeFile = this.app.workspace.getActiveFile();
     if (activeFile) {
       this.connectSocket(activeFile.path);
@@ -143,8 +155,8 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     }
     const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
     const encodedId = encodeURIComponent(fileId);
-    const url = `${baseUrl}/ws/${encodedId}/${this.clientId}`;
-    console.log("Connecting to:", url);
+    const url = `${baseUrl}/ws/${encodedId}/${encodeURIComponent(this.activeClientId)}`;
+    console.log("Connecting to:", url, "as", this.activeClientId);
     try {
       this.socket = new WebSocket(url);
       this.socket.onopen = () => console.log("CyberSync connected");
@@ -152,7 +164,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
         const data = JSON.parse(event.data);
         const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
         if (!view) return;
-        if (data.clientId === this.clientId) return;
+        if (data.clientId === this.activeClientId) return;
         if (data.type === "cursor") {
           view.editor.cm.dispatch({
             effects: updateCursorEffect.of({
@@ -185,9 +197,17 @@ var CyberSyncSettingTab = class extends import_obsidian.PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
     containerEl.createEl("h2", { text: "CyberSync Settings" });
-    new import_obsidian.Setting(containerEl).setName("Server URL").setDesc("WebSocket server address (e.g. ws://192.168.1.5:8000)").addText(
+    new import_obsidian.Setting(containerEl).setName("Server URL").setDesc("WebSocket server address").addText(
       (text) => text.setPlaceholder("ws://localhost:8000").setValue(this.plugin.settings.serverUrl).onChange(async (value) => {
         this.plugin.settings.serverUrl = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Client ID").setDesc(
+      "Your nickname shown to others. Leave empty for random ID."
+    ).addText(
+      (text) => text.setPlaceholder("Enter your name").setValue(this.plugin.settings.clientId).onChange(async (value) => {
+        this.plugin.settings.clientId = value;
         await this.plugin.saveSettings();
       })
     );

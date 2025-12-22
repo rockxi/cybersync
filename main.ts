@@ -12,10 +12,12 @@ import {
 // --- НАСТРОЙКИ ---
 interface CyberSyncSettings {
     serverUrl: string;
+    clientId: string; // Новое поле
 }
 
 const DEFAULT_SETTINGS: CyberSyncSettings = {
     serverUrl: "ws://localhost:8000",
+    clientId: "", // По умолчанию пусто, будет генерироваться случайно
 };
 
 // --- ТИПЫ ДАННЫХ ---
@@ -89,22 +91,22 @@ const cursorField = StateField.define<DecorationSet>({
 export default class SyncPlugin extends Plugin {
     settings: CyberSyncSettings;
     socket: WebSocket | null = null;
-    clientId: string = "User_" + Math.floor(Math.random() * 1000);
+    activeClientId: string; // ID, который используется в текущей сессии
     color: string = "#" + Math.floor(Math.random() * 16777215).toString(16);
 
     async onload() {
-        // 1. Загружаем настройки
         await this.loadSettings();
 
-        // 2. Добавляем вкладку настроек
+        // Устанавливаем ID: из настроек или генерируем новый
+        this.updateActiveClientId();
+
         this.addSettingTab(new CyberSyncSettingTab(this.app, this));
 
-        // 3. Логика ViewPlugin (как в твоем рабочем коде)
+        const pluginInstance = this;
         const socketListener = ViewPlugin.fromClass(
             class {
                 constructor(public view: EditorView) {}
                 update(update: ViewUpdate) {
-                    // pluginInstance доступен через замыкание ниже
                     if (
                         update.selectionSet &&
                         pluginInstance.socket?.readyState === WebSocket.OPEN
@@ -122,17 +124,23 @@ export default class SyncPlugin extends Plugin {
             },
         );
 
-        const pluginInstance = this;
         this.registerEditorExtension([cursorField, socketListener]);
 
         this.app.workspace.on("file-open", (file) => {
             if (file) this.connectSocket(file.path);
         });
 
-        // Если файл уже открыт при старте
         const activeFile = this.app.workspace.getActiveFile();
         if (activeFile) {
             this.connectSocket(activeFile.path);
+        }
+    }
+
+    updateActiveClientId() {
+        if (this.settings.clientId && this.settings.clientId.trim() !== "") {
+            this.activeClientId = this.settings.clientId.trim();
+        } else {
+            this.activeClientId = "User_" + Math.floor(Math.random() * 1000);
         }
     }
 
@@ -146,7 +154,8 @@ export default class SyncPlugin extends Plugin {
 
     async saveSettings() {
         await this.saveData(this.settings);
-        // Переподключаемся при сохранении настроек, если есть активный файл
+        this.updateActiveClientId(); // Обновляем рабочий ID
+
         const activeFile = this.app.workspace.getActiveFile();
         if (activeFile) {
             this.connectSocket(activeFile.path);
@@ -159,22 +168,16 @@ export default class SyncPlugin extends Plugin {
             this.socket = null;
         }
 
-        // 1. Берем базовый URL из настроек (убираем слеш в конце)
         const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
-
-        // 2. Кодируем ID файла, как это было в рабочем коде
         const encodedId = encodeURIComponent(fileId);
+        // Используем activeClientId
+        const url = `${baseUrl}/ws/${encodedId}/${encodeURIComponent(this.activeClientId)}`;
 
-        // 3. Формируем URL в формате, который ожидает твой ТЕКУЩИЙ сервер:
-        // /ws/{FILE_ID}/{CLIENT_ID}
-        const url = `${baseUrl}/ws/${encodedId}/${this.clientId}`;
-
-        console.log("Connecting to:", url);
+        console.log("Connecting to:", url, "as", this.activeClientId);
 
         try {
             this.socket = new WebSocket(url);
 
-            // ... (остальной код обработчиков без изменений)
             this.socket.onopen = () => console.log("CyberSync connected");
 
             this.socket.onmessage = (event) => {
@@ -184,7 +187,7 @@ export default class SyncPlugin extends Plugin {
                 if (!view) return;
 
                 // Фильтр своего эха
-                if (data.clientId === this.clientId) return;
+                if (data.clientId === this.activeClientId) return;
 
                 if (data.type === "cursor") {
                     view.editor.cm.dispatch({
@@ -227,13 +230,28 @@ class CyberSyncSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName("Server URL")
-            .setDesc("WebSocket server address (e.g. ws://192.168.1.5:8000)")
+            .setDesc("WebSocket server address")
             .addText((text) =>
                 text
                     .setPlaceholder("ws://localhost:8000")
                     .setValue(this.plugin.settings.serverUrl)
                     .onChange(async (value) => {
                         this.plugin.settings.serverUrl = value;
+                        await this.plugin.saveSettings();
+                    }),
+            );
+
+        new Setting(containerEl)
+            .setName("Client ID")
+            .setDesc(
+                "Your nickname shown to others. Leave empty for random ID.",
+            )
+            .addText((text) =>
+                text
+                    .setPlaceholder("Enter your name")
+                    .setValue(this.plugin.settings.clientId)
+                    .onChange(async (value) => {
+                        this.plugin.settings.clientId = value;
                         await this.plugin.saveSettings();
                     }),
             );

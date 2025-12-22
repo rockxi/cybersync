@@ -74,18 +74,15 @@ const cursorField = StateField.define<DecorationSet>({
         return Decoration.none;
     },
     update(cursors, tr) {
-        // --- ЗАЩИТА №1: Глобальный try-catch на обновление поля ---
         try {
-            // Если документ менялся удаленно, маппинг может упасть
             try {
                 cursors = cursors.map(tr.changes);
             } catch (e) {
-                return Decoration.none; // Сброс при ошибке маппинга
+                return Decoration.none;
             }
 
             for (let e of tr.effects) {
                 if (e.is(updateCursorEffect)) {
-                    // --- ЗАЩИТА №2: Проверка границ ---
                     if (e.value.pos < 0 || e.value.pos > tr.newDoc.length)
                         continue;
 
@@ -112,7 +109,6 @@ const cursorField = StateField.define<DecorationSet>({
             }
             return cursors;
         } catch (e) {
-            console.warn("CyberSync: Cursor update failed, resetting.", e);
             return Decoration.none;
         }
     },
@@ -212,7 +208,6 @@ export default class SyncPlugin extends Plugin {
             cls: "cybersync-status-icon",
         });
 
-        // Упростил статус бар, чтобы не мигал слишком часто
         let text = "● CyberSync: Off";
         let color = "var(--text-muted)";
 
@@ -235,9 +230,6 @@ export default class SyncPlugin extends Plugin {
         if (this.isRequestingFullSync) return;
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
 
-        // Ограничиваем логи
-        // console.log("CyberSync: Requesting Full Sync...");
-
         this.isRequestingFullSync = true;
         this.updateStatusBar("syncing");
 
@@ -249,7 +241,6 @@ export default class SyncPlugin extends Plugin {
 
         setTimeout(() => {
             if (this.isRequestingFullSync) {
-                // console.warn("CyberSync: Full sync timed out");
                 this.isRequestingFullSync = false;
                 this.updateStatusBar("connected");
             }
@@ -274,7 +265,6 @@ export default class SyncPlugin extends Plugin {
     }
 
     // --- НОРМАЛИЗАЦИЯ (LF) ---
-    // Приводим все переносы строк к \n, чтобы длина совпадала везде
     normalizeText(text: string): string {
         return text.replace(/\r\n/g, "\n");
     }
@@ -344,7 +334,6 @@ export default class SyncPlugin extends Plugin {
                     try {
                         const changes = ChangeSet.fromJSON(data.changes);
                         if (changes.length !== cm.state.doc.length) {
-                            // console.warn(`CyberSync: Mismatch v${data.version}. Req Full Sync.`);
                             this.requestFullSync(file.path);
                             return;
                         }
@@ -361,7 +350,6 @@ export default class SyncPlugin extends Plugin {
                                 data.version,
                             );
                     } catch (e) {
-                        // console.error("Apply delta failed", e);
                         this.requestFullSync(file.path);
                     } finally {
                         if (!data.is_history) this.updateStatusBar("connected");
@@ -373,7 +361,7 @@ export default class SyncPlugin extends Plugin {
                     const ver = Number(data.version || 0);
                     if (ver) {
                         await this.updateLocalVersion(file.path, ver);
-                        // НОРМАЛИЗУЕМ ПЕРЕД ОТПРАВКОЙ SNAPSHOT
+                        // ВАЖНО: Нормализуем перед отправкой!
                         const content = this.normalizeText(
                             cm.state.doc.toString(),
                         );
@@ -392,7 +380,6 @@ export default class SyncPlugin extends Plugin {
                     this.isRequestingFullSync = false;
 
                     try {
-                        // НОРМАЛИЗУЕМ ПРИ ПОЛУЧЕНИИ
                         const serverContent = this.normalizeText(
                             data.content || "",
                         );
@@ -401,20 +388,20 @@ export default class SyncPlugin extends Plugin {
                         );
                         const serverVer = Number(data.version || 0);
 
-                        // console.log(`CyberSync: Applying Full Sync v${serverVer}`);
+                        console.log(
+                            `CyberSync: Applying Full Sync v${serverVer}`,
+                        );
 
                         if (serverContent === localContent) {
                             await this.updateLocalVersion(file.path, serverVer);
-                            // console.log("CyberSync: Full sync matched.");
-                        }
-                        // Проверка на невидимые отличия (пробелы в конце)
-                        else if (
+                            console.log("CyberSync: Full sync matched.");
+                        } else if (
                             serverContent.trimEnd() === localContent.trimEnd()
                         ) {
                             cm.dispatch({
                                 changes: {
                                     from: 0,
-                                    to: cm.state.doc.length, // Используем реальную длину документа
+                                    to: cm.state.doc.length,
                                     insert: serverContent,
                                 },
                                 scrollIntoView: false,
@@ -428,7 +415,6 @@ export default class SyncPlugin extends Plugin {
                                 this.hasConflictMarkers(localContent);
 
                             if (!serverHasMarkers && localHasMarkers) {
-                                // console.log("CyberSync: Remote resolved conflict.");
                                 cm.dispatch({
                                     changes: {
                                         from: 0,

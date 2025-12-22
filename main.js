@@ -88,7 +88,6 @@ var cursorField = import_state.StateField.define({
       }
       return cursors;
     } catch (e) {
-      console.warn("CyberSync: Cursor update failed, resetting.", e);
       return import_view.Decoration.none;
     }
   },
@@ -217,7 +216,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     return /^<<<<<<< REMOTE \(Server v\d+\)/m.test(text);
   }
   // --- НОРМАЛИЗАЦИЯ (LF) ---
-  // Приводим все переносы строк к \n, чтобы длина совпадала везде
   normalizeText(text) {
     return text.replace(/\r\n/g, "\n");
   }
@@ -313,14 +311,17 @@ var SyncPlugin = class extends import_obsidian.Plugin {
               cm.state.doc.toString()
             );
             const serverVer = Number(data.version || 0);
+            console.log(
+              `CyberSync: Applying Full Sync v${serverVer}`
+            );
             if (serverContent === localContent) {
               await this.updateLocalVersion(file.path, serverVer);
+              console.log("CyberSync: Full sync matched.");
             } else if (serverContent.trimEnd() === localContent.trimEnd()) {
               cm.dispatch({
                 changes: {
                   from: 0,
                   to: cm.state.doc.length,
-                  // Используем реальную длину документа
                   insert: serverContent
                 },
                 scrollIntoView: false,

@@ -117,9 +117,11 @@ const cursorField = StateField.define<DecorationSet>({
 export default class SyncPlugin extends Plugin {
     settings: CyberSyncSettings;
 
-    // ДВА СОКЕТА:
-    fileSocket: WebSocket | null = null; // Для текста (меняется)
-    vaultSocket: WebSocket | null = null; // Для файлов (вечный)
+    fileSocket: WebSocket | null = null;
+    vaultSocket: WebSocket | null = null;
+
+    // Очередь для сообщений Vault (если сокет не готов)
+    private vaultMessageQueue: string[] = [];
 
     activeClientId: string;
     color: string = "#" + Math.floor(Math.random() * 16777215).toString(16);
@@ -128,10 +130,10 @@ export default class SyncPlugin extends Plugin {
     private isRequestingFullSync = false;
     private lastLocalChangeTime = 0;
 
-    // Флаг защиты от циклов для действий с файлами
     private isApplyingRemoteVaultAction = false;
 
     async onload() {
+        console.log("CyberSync: Plugin Loading...");
         await this.loadSettings();
         this.updateActiveClientId();
 
@@ -140,10 +142,10 @@ export default class SyncPlugin extends Plugin {
 
         this.addSettingTab(new CyberSyncSettingTab(this.app, this));
 
-        // 1. Подключаем Глобальный Сокет (для файлов)
+        // 1. Сразу пробуем подключить Vault Socket
         this.connectVaultSocket();
 
-        // 2. Слушаем события Obsidian (создание, удаление, переименование)
+        // 2. Регистрируем события Vault
         this.registerEvent(
             this.app.vault.on("create", (file) => this.onLocalFileCreate(file)),
         );
@@ -156,14 +158,12 @@ export default class SyncPlugin extends Plugin {
             ),
         );
 
-        // 3. Логика синхронизации текста
+        // 3. Text Sync logic
         const pluginInstance = this;
         const syncExtension = EditorView.updateListener.of(
             (update: ViewUpdate) => {
-                // Используем fileSocket для текста
                 if (pluginInstance.fileSocket?.readyState !== WebSocket.OPEN)
                     return;
-
                 if (
                     update.transactions.some((tr) =>
                         tr.annotation(RemoteUpdate),
@@ -204,7 +204,6 @@ export default class SyncPlugin extends Plugin {
 
         this.registerEditorExtension([cursorField, syncExtension]);
 
-        // При смене активного файла переподключаем fileSocket
         this.app.workspace.on("file-open", (file) => {
             if (file) this.connectFileSocket(file.path);
             else if (this.fileSocket) {
@@ -213,86 +212,109 @@ export default class SyncPlugin extends Plugin {
             }
         });
 
-        // Если файл уже открыт
         const activeFile = this.app.workspace.getActiveFile();
         if (activeFile) this.connectFileSocket(activeFile.path);
     }
 
-    // --- ЛОГИКА VAULT SYNC (ОБРАБОТЧИКИ ЛОКАЛЬНЫХ СОБЫТИЙ) ---
+    // --- VAULT EVENTS ---
+
+    sendVaultMessage(msg: any) {
+        const json = JSON.stringify(msg);
+        if (
+            this.vaultSocket &&
+            this.vaultSocket.readyState === WebSocket.OPEN
+        ) {
+            this.vaultSocket.send(json);
+        } else {
+            console.log(
+                "CyberSync: Vault socket not ready, queuing message:",
+                msg.type,
+            );
+            this.vaultMessageQueue.push(json);
+        }
+    }
 
     onLocalFileCreate(file: TAbstractFile) {
         if (this.isApplyingRemoteVaultAction) return;
-        if (this.vaultSocket?.readyState !== WebSocket.OPEN) return;
-        if (!(file instanceof TFile)) return; // Пока только файлы, папки можно добавить позже
-
-        console.log("Local Create:", file.path);
-        this.vaultSocket.send(
-            JSON.stringify({
-                type: "file_created",
-                path: file.path,
-            }),
-        );
+        if (!(file instanceof TFile)) return;
+        console.log("CyberSync: Local Create Detected ->", file.path);
+        this.sendVaultMessage({ type: "file_created", path: file.path });
     }
 
     onLocalFileDelete(file: TAbstractFile) {
         if (this.isApplyingRemoteVaultAction) return;
-        if (this.vaultSocket?.readyState !== WebSocket.OPEN) return;
         if (!(file instanceof TFile)) return;
-
-        console.log("Local Delete:", file.path);
-        this.vaultSocket.send(
-            JSON.stringify({
-                type: "file_deleted",
-                path: file.path,
-            }),
-        );
+        console.log("CyberSync: Local Delete Detected ->", file.path);
+        this.sendVaultMessage({ type: "file_deleted", path: file.path });
     }
 
     onLocalFileRename(file: TAbstractFile, oldPath: string) {
         if (this.isApplyingRemoteVaultAction) return;
-        if (this.vaultSocket?.readyState !== WebSocket.OPEN) return;
         if (!(file instanceof TFile)) return;
-
-        console.log("Local Rename:", oldPath, "->", file.path);
-        this.vaultSocket.send(
-            JSON.stringify({
-                type: "file_renamed",
-                path: file.path,
-                oldPath: oldPath,
-            }),
+        console.log(
+            "CyberSync: Local Rename Detected ->",
+            oldPath,
+            "to",
+            file.path,
         );
+        this.sendVaultMessage({
+            type: "file_renamed",
+            path: file.path,
+            oldPath: oldPath,
+        });
     }
 
-    // --- ПОДКЛЮЧЕНИЕ ГЛОБАЛЬНОГО СОКЕТА ---
+    // --- VAULT SOCKET CONNECTION ---
     connectVaultSocket() {
         const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
+        // Важно: file_id=__global__
         const url = `${baseUrl}/ws?file_id=__global__&client_id=${encodeURIComponent(this.activeClientId)}`;
 
+        console.log("CyberSync: Connecting to Vault Socket...", url);
+
         try {
+            if (this.vaultSocket) {
+                this.vaultSocket.close();
+            }
+
             this.vaultSocket = new WebSocket(url);
 
             this.vaultSocket.onopen = () => {
-                console.log("CyberSync: Connected to Global Vault");
-                // Можно отправить приветственное сообщение, но сервер сам пришлет init
+                console.log("CyberSync: ✅ Connected to Global Vault!");
+                // Отправляем все накопившиеся сообщения
+                while (this.vaultMessageQueue.length > 0) {
+                    const msg = this.vaultMessageQueue.shift();
+                    if (msg) this.vaultSocket?.send(msg);
+                }
             };
 
             this.vaultSocket.onmessage = async (event) => {
                 const data = JSON.parse(event.data);
-                if (data.clientId === this.activeClientId) return; // Игнор своих сообщений
+                if (data.clientId === this.activeClientId) return;
+
+                console.log(
+                    "CyberSync: Received Vault Event:",
+                    data.type,
+                    data.path,
+                );
 
                 this.isApplyingRemoteVaultAction = true;
                 try {
-                    // 1. Инициализация (пришли все файлы)
                     if (data.type === "vault_sync_init") {
                         const serverFiles: string[] = data.files || [];
-                        console.log("Vault Init. Files:", serverFiles.length);
-                        // Простая стратегия: если файла нет у нас - создаем пустой
+                        console.log(
+                            "CyberSync: Initial Sync. Files:",
+                            serverFiles.length,
+                        );
                         for (const path of serverFiles) {
                             if (!this.app.vault.getAbstractFileByPath(path)) {
                                 try {
                                     await this.createFolderRecursively(path);
                                     await this.app.vault.create(path, "");
-                                    console.log("Synced missing file:", path);
+                                    console.log(
+                                        "CyberSync: Synced missing file:",
+                                        path,
+                                    );
                                 } catch (e) {
                                     console.warn(
                                         "Failed to sync file:",
@@ -302,17 +324,13 @@ export default class SyncPlugin extends Plugin {
                                 }
                             }
                         }
-                    }
-                    // 2. Создание
-                    else if (data.type === "file_created") {
+                    } else if (data.type === "file_created") {
                         if (!this.app.vault.getAbstractFileByPath(data.path)) {
                             await this.createFolderRecursively(data.path);
                             await this.app.vault.create(data.path, "");
                             new Notice(`Remote created: ${data.path}`);
                         }
-                    }
-                    // 3. Удаление
-                    else if (data.type === "file_deleted") {
+                    } else if (data.type === "file_deleted") {
                         const file = this.app.vault.getAbstractFileByPath(
                             data.path,
                         );
@@ -320,9 +338,7 @@ export default class SyncPlugin extends Plugin {
                             await this.app.vault.delete(file);
                             new Notice(`Remote deleted: ${data.path}`);
                         }
-                    }
-                    // 4. Переименование
-                    else if (data.type === "file_renamed") {
+                    } else if (data.type === "file_renamed") {
                         const file = this.app.vault.getAbstractFileByPath(
                             data.oldPath,
                         );
@@ -342,11 +358,15 @@ export default class SyncPlugin extends Plugin {
             };
 
             this.vaultSocket.onclose = () => {
-                console.log("Vault Socket closed. Reconnecting in 5s...");
+                console.warn("CyberSync: Vault Socket closed. Retry in 5s...");
                 setTimeout(() => this.connectVaultSocket(), 5000);
             };
+
+            this.vaultSocket.onerror = (e) => {
+                console.error("CyberSync: Vault Socket Error", e);
+            };
         } catch (e) {
-            console.error("Failed to connect Vault Socket", e);
+            console.error("CyberSync: Failed to connect Vault Socket", e);
         }
     }
 
@@ -364,7 +384,7 @@ export default class SyncPlugin extends Plugin {
         }
     }
 
-    // --- ОБЫЧНЫЕ ФУНКЦИИ (TEXT SYNC) ---
+    // --- TEXT SYNC HELPERS ---
 
     async updateLocalVersion(filePath: string, version: number) {
         this.settings.fileVersions[filePath] = version;
@@ -616,6 +636,23 @@ export default class SyncPlugin extends Plugin {
             this.updateStatusBar("error");
             this.isRequestingFullSync = false;
         }
+    }
+
+    requestFullSync(fileId: string) {
+        if (this.isRequestingFullSync) return;
+        if (!this.fileSocket || this.fileSocket.readyState !== WebSocket.OPEN)
+            return;
+
+        this.isRequestingFullSync = true;
+        this.updateStatusBar("syncing");
+        this.fileSocket.send(JSON.stringify({ type: "full_sync" }));
+
+        setTimeout(() => {
+            if (this.isRequestingFullSync) {
+                this.isRequestingFullSync = false;
+                this.updateStatusBar("connected");
+            }
+        }, 5000);
     }
 
     onunload() {

@@ -249,6 +249,10 @@ var SyncPlugin = class extends import_obsidian.Plugin {
         const cm = view.editor.cm;
         if (data.type === "text_change") {
           if (this.isRequestingFullSync) return;
+          const localVer = this.getLocalVersion(file.path);
+          if (data.version && data.version <= localVer) {
+            return;
+          }
           if (data.clientId === this.activeClientId && !data.is_history)
             return;
           this.isApplyingRemoteChange = true;

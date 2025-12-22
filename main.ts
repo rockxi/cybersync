@@ -27,7 +27,6 @@ import {
 interface CyberSyncSettings {
     serverUrl: string;
     clientId: string;
-    // Словарь: путь_к_файлу -> номер_версии
     fileVersions: Record<string, number>;
 }
 
@@ -124,8 +123,6 @@ export default class SyncPlugin extends Plugin {
                 if (pluginInstance.socket?.readyState !== WebSocket.OPEN)
                     return;
 
-                // Отправляем изменения ТОЛЬКО если это пользовательский ввод
-                // и мы не находимся в процессе применения серверных патчей
                 if (
                     update.docChanged &&
                     !this.isApplyingRemoteChange &&
@@ -146,7 +143,6 @@ export default class SyncPlugin extends Plugin {
                     );
                 }
 
-                // Для курсоров
                 if (update.selectionSet && !this.isApplyingRemoteChange) {
                     const pos = update.state.selection.main.head;
                     pluginInstance.socket.send(
@@ -224,7 +220,6 @@ export default class SyncPlugin extends Plugin {
     }
 
     requestFullSync(fileId: string) {
-        // Блокировка повторных запросов
         if (this.isRequestingFullSync) return;
 
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
@@ -239,7 +234,7 @@ export default class SyncPlugin extends Plugin {
             }),
         );
 
-        // Сброс флага через 5 сек на всякий случай, если сервер не ответил
+        // Сброс флага через 5 сек
         setTimeout(() => {
             if (this.isRequestingFullSync) {
                 console.warn("CyberSync: Full sync timed out, resetting flag");
@@ -268,7 +263,6 @@ export default class SyncPlugin extends Plugin {
             this.socket = null;
         }
 
-        // Сбрасываем флаги при новом подключении
         this.isRequestingFullSync = false;
         this.isApplyingRemoteChange = false;
 
@@ -318,8 +312,15 @@ export default class SyncPlugin extends Plugin {
 
                 // --- TEXT CHANGE ---
                 if (data.type === "text_change") {
-                    // Если мы уже запросили Full Sync, игнорируем любые дельты, чтобы не спамить
+                    // 1. Блокировка: если ждем Full Sync, дельты не нужны
                     if (this.isRequestingFullSync) return;
+
+                    // 2. Версионность: если изменение старое (<= текущей версии), игнорируем его
+                    const localVer = this.getLocalVersion(file.path);
+                    if (data.version && data.version <= localVer) {
+                        // console.log(`CyberSync: Ignored old delta v${data.version} (have v${localVer})`);
+                        return;
+                    }
 
                     if (
                         data.clientId === this.activeClientId &&
@@ -333,6 +334,7 @@ export default class SyncPlugin extends Plugin {
                     try {
                         const changes = ChangeSet.fromJSON(data.changes);
 
+                        // 3. Целостность: если длина не совпадает
                         if (changes.length !== cm.state.doc.length) {
                             console.warn(
                                 `CyberSync: Mismatch! Remote len ${changes.length} != Local ${cm.state.doc.length}.`,
@@ -354,7 +356,6 @@ export default class SyncPlugin extends Plugin {
                         }
                     } catch (e) {
                         console.error("CyberSync: Failed to apply delta", e);
-                        // Ошибка применения -> запрашиваем Full Sync
                         this.requestFullSync(file.path);
                     } finally {
                         this.isApplyingRemoteChange = false;
@@ -368,7 +369,6 @@ export default class SyncPlugin extends Plugin {
                     const ver = Number(data.version || 0);
                     if (ver) {
                         await this.updateLocalVersion(file.path, ver);
-                        // Шлем снапшот на сервер, чтобы он обновил backup
                         const content = cm.state.doc.toString();
                         this.socket?.send(
                             JSON.stringify({
@@ -382,8 +382,7 @@ export default class SyncPlugin extends Plugin {
 
                 // --- FULL SYNC ---
                 else if (data.type === "full_sync") {
-                    // Мы получили Full Sync - сбрасываем флаг блокировки
-                    this.isRequestingFullSync = false;
+                    this.isRequestingFullSync = false; // Снимаем блокировку
                     this.isApplyingRemoteChange = true;
 
                     try {
@@ -422,10 +421,7 @@ ${localContent}
                         this.isApplyingRemoteChange = false;
                         this.updateStatusBar("connected");
                     }
-                }
-
-                // --- CURSOR ---
-                else if (data.type === "cursor") {
+                } else if (data.type === "cursor") {
                     if (data.clientId === this.activeClientId) return;
                     cm.dispatch({
                         effects: updateCursorEffect.of({

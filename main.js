@@ -313,9 +313,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
               cm.state.doc.toString()
             );
             const serverVer = Number(data.version || 0);
-            console.log(
-              `CyberSync: Applying Full Sync v${serverVer}`
-            );
             if (serverContent === localContent) {
               await this.updateLocalVersion(file.path, serverVer);
             } else if (serverContent.trimEnd() === localContent.trimEnd()) {

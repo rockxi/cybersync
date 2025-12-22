@@ -391,10 +391,6 @@ export default class SyncPlugin extends Plugin {
                         );
                         const serverVer = Number(data.version || 0);
 
-                        console.log(
-                            `CyberSync: Applying Full Sync v${serverVer}`,
-                        );
-
                         // 1. Идеальное совпадение
                         if (serverContent === localContent) {
                             await this.updateLocalVersion(file.path, serverVer);

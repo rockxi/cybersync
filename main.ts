@@ -6,6 +6,7 @@ import {
     MarkdownView,
     TFile,
     Notice,
+    TAbstractFile,
 } from "obsidian";
 import {
     Extension,
@@ -85,7 +86,6 @@ const cursorField = StateField.define<DecorationSet>({
                 if (e.is(updateCursorEffect)) {
                     if (e.value.pos < 0 || e.value.pos > tr.newDoc.length)
                         continue;
-
                     const deco = Decoration.widget({
                         widget: new CursorWidget(
                             e.value.color,
@@ -93,7 +93,6 @@ const cursorField = StateField.define<DecorationSet>({
                         ),
                         side: 0,
                     }).range(e.value.pos);
-
                     cursors = cursors.update({
                         filter: (from, to, value) =>
                             (value.widget as any).label !== e.value.clientId,
@@ -117,13 +116,20 @@ const cursorField = StateField.define<DecorationSet>({
 
 export default class SyncPlugin extends Plugin {
     settings: CyberSyncSettings;
-    socket: WebSocket | null = null;
+
+    // ДВА СОКЕТА:
+    fileSocket: WebSocket | null = null; // Для текста (меняется)
+    vaultSocket: WebSocket | null = null; // Для файлов (вечный)
+
     activeClientId: string;
     color: string = "#" + Math.floor(Math.random() * 16777215).toString(16);
     statusBarItem: HTMLElement;
 
     private isRequestingFullSync = false;
     private lastLocalChangeTime = 0;
+
+    // Флаг защиты от циклов для действий с файлами
+    private isApplyingRemoteVaultAction = false;
 
     async onload() {
         await this.loadSettings();
@@ -134,23 +140,40 @@ export default class SyncPlugin extends Plugin {
 
         this.addSettingTab(new CyberSyncSettingTab(this.app, this));
 
+        // 1. Подключаем Глобальный Сокет (для файлов)
+        this.connectVaultSocket();
+
+        // 2. Слушаем события Obsidian (создание, удаление, переименование)
+        this.registerEvent(
+            this.app.vault.on("create", (file) => this.onLocalFileCreate(file)),
+        );
+        this.registerEvent(
+            this.app.vault.on("delete", (file) => this.onLocalFileDelete(file)),
+        );
+        this.registerEvent(
+            this.app.vault.on("rename", (file, oldPath) =>
+                this.onLocalFileRename(file, oldPath),
+            ),
+        );
+
+        // 3. Логика синхронизации текста
         const pluginInstance = this;
         const syncExtension = EditorView.updateListener.of(
             (update: ViewUpdate) => {
-                if (pluginInstance.socket?.readyState !== WebSocket.OPEN)
+                // Используем fileSocket для текста
+                if (pluginInstance.fileSocket?.readyState !== WebSocket.OPEN)
                     return;
 
                 if (
                     update.transactions.some((tr) =>
                         tr.annotation(RemoteUpdate),
                     )
-                ) {
+                )
                     return;
-                }
 
                 if (update.docChanged) {
                     pluginInstance.lastLocalChangeTime = Date.now();
-                    pluginInstance.socket.send(
+                    pluginInstance.fileSocket.send(
                         JSON.stringify({
                             type: "text_change",
                             changes: update.changes.toJSON(),
@@ -166,7 +189,7 @@ export default class SyncPlugin extends Plugin {
                         )
                     ) {
                         const pos = update.state.selection.main.head;
-                        pluginInstance.socket.send(
+                        pluginInstance.fileSocket.send(
                             JSON.stringify({
                                 type: "cursor",
                                 pos: pos,
@@ -181,13 +204,167 @@ export default class SyncPlugin extends Plugin {
 
         this.registerEditorExtension([cursorField, syncExtension]);
 
+        // При смене активного файла переподключаем fileSocket
         this.app.workspace.on("file-open", (file) => {
-            if (file) this.connectSocket(file.path);
+            if (file) this.connectFileSocket(file.path);
+            else if (this.fileSocket) {
+                this.fileSocket.close();
+                this.fileSocket = null;
+            }
         });
 
+        // Если файл уже открыт
         const activeFile = this.app.workspace.getActiveFile();
-        if (activeFile) this.connectSocket(activeFile.path);
+        if (activeFile) this.connectFileSocket(activeFile.path);
     }
+
+    // --- ЛОГИКА VAULT SYNC (ОБРАБОТЧИКИ ЛОКАЛЬНЫХ СОБЫТИЙ) ---
+
+    onLocalFileCreate(file: TAbstractFile) {
+        if (this.isApplyingRemoteVaultAction) return;
+        if (this.vaultSocket?.readyState !== WebSocket.OPEN) return;
+        if (!(file instanceof TFile)) return; // Пока только файлы, папки можно добавить позже
+
+        console.log("Local Create:", file.path);
+        this.vaultSocket.send(
+            JSON.stringify({
+                type: "file_created",
+                path: file.path,
+            }),
+        );
+    }
+
+    onLocalFileDelete(file: TAbstractFile) {
+        if (this.isApplyingRemoteVaultAction) return;
+        if (this.vaultSocket?.readyState !== WebSocket.OPEN) return;
+        if (!(file instanceof TFile)) return;
+
+        console.log("Local Delete:", file.path);
+        this.vaultSocket.send(
+            JSON.stringify({
+                type: "file_deleted",
+                path: file.path,
+            }),
+        );
+    }
+
+    onLocalFileRename(file: TAbstractFile, oldPath: string) {
+        if (this.isApplyingRemoteVaultAction) return;
+        if (this.vaultSocket?.readyState !== WebSocket.OPEN) return;
+        if (!(file instanceof TFile)) return;
+
+        console.log("Local Rename:", oldPath, "->", file.path);
+        this.vaultSocket.send(
+            JSON.stringify({
+                type: "file_renamed",
+                path: file.path,
+                oldPath: oldPath,
+            }),
+        );
+    }
+
+    // --- ПОДКЛЮЧЕНИЕ ГЛОБАЛЬНОГО СОКЕТА ---
+    connectVaultSocket() {
+        const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
+        const url = `${baseUrl}/ws?file_id=__global__&client_id=${encodeURIComponent(this.activeClientId)}`;
+
+        try {
+            this.vaultSocket = new WebSocket(url);
+
+            this.vaultSocket.onopen = () => {
+                console.log("CyberSync: Connected to Global Vault");
+                // Можно отправить приветственное сообщение, но сервер сам пришлет init
+            };
+
+            this.vaultSocket.onmessage = async (event) => {
+                const data = JSON.parse(event.data);
+                if (data.clientId === this.activeClientId) return; // Игнор своих сообщений
+
+                this.isApplyingRemoteVaultAction = true;
+                try {
+                    // 1. Инициализация (пришли все файлы)
+                    if (data.type === "vault_sync_init") {
+                        const serverFiles: string[] = data.files || [];
+                        console.log("Vault Init. Files:", serverFiles.length);
+                        // Простая стратегия: если файла нет у нас - создаем пустой
+                        for (const path of serverFiles) {
+                            if (!this.app.vault.getAbstractFileByPath(path)) {
+                                try {
+                                    await this.createFolderRecursively(path);
+                                    await this.app.vault.create(path, "");
+                                    console.log("Synced missing file:", path);
+                                } catch (e) {
+                                    console.warn(
+                                        "Failed to sync file:",
+                                        path,
+                                        e,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // 2. Создание
+                    else if (data.type === "file_created") {
+                        if (!this.app.vault.getAbstractFileByPath(data.path)) {
+                            await this.createFolderRecursively(data.path);
+                            await this.app.vault.create(data.path, "");
+                            new Notice(`Remote created: ${data.path}`);
+                        }
+                    }
+                    // 3. Удаление
+                    else if (data.type === "file_deleted") {
+                        const file = this.app.vault.getAbstractFileByPath(
+                            data.path,
+                        );
+                        if (file) {
+                            await this.app.vault.delete(file);
+                            new Notice(`Remote deleted: ${data.path}`);
+                        }
+                    }
+                    // 4. Переименование
+                    else if (data.type === "file_renamed") {
+                        const file = this.app.vault.getAbstractFileByPath(
+                            data.oldPath,
+                        );
+                        if (file) {
+                            await this.createFolderRecursively(data.path);
+                            await this.app.vault.rename(file, data.path);
+                            new Notice(
+                                `Remote renamed: ${data.oldPath} -> ${data.path}`,
+                            );
+                        }
+                    }
+                } catch (e) {
+                    console.error("Vault Sync Error:", e);
+                } finally {
+                    this.isApplyingRemoteVaultAction = false;
+                }
+            };
+
+            this.vaultSocket.onclose = () => {
+                console.log("Vault Socket closed. Reconnecting in 5s...");
+                setTimeout(() => this.connectVaultSocket(), 5000);
+            };
+        } catch (e) {
+            console.error("Failed to connect Vault Socket", e);
+        }
+    }
+
+    async createFolderRecursively(path: string) {
+        const folders = path.split("/").slice(0, -1);
+        if (folders.length === 0) return;
+
+        let currentPath = "";
+        for (const folder of folders) {
+            currentPath =
+                currentPath === "" ? folder : `${currentPath}/${folder}`;
+            if (!this.app.vault.getAbstractFileByPath(currentPath)) {
+                await this.app.vault.createFolder(currentPath);
+            }
+        }
+    }
+
+    // --- ОБЫЧНЫЕ ФУНКЦИИ (TEXT SYNC) ---
 
     async updateLocalVersion(filePath: string, version: number) {
         this.settings.fileVersions[filePath] = version;
@@ -209,7 +386,6 @@ export default class SyncPlugin extends Plugin {
         const icon = this.statusBarItem.createSpan({
             cls: "cybersync-status-icon",
         });
-
         let text = "● CyberSync: Off";
         let color = "var(--text-muted)";
 
@@ -226,27 +402,6 @@ export default class SyncPlugin extends Plugin {
 
         icon.setText(text);
         icon.style.color = color;
-    }
-
-    requestFullSync(fileId: string) {
-        if (this.isRequestingFullSync) return;
-        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-
-        this.isRequestingFullSync = true;
-        this.updateStatusBar("syncing");
-
-        this.socket.send(
-            JSON.stringify({
-                type: "full_sync",
-            }),
-        );
-
-        setTimeout(() => {
-            if (this.isRequestingFullSync) {
-                this.isRequestingFullSync = false;
-                this.updateStatusBar("connected");
-            }
-        }, 5000);
     }
 
     async loadSettings() {
@@ -270,29 +425,26 @@ export default class SyncPlugin extends Plugin {
         return text.replace(/\r\n/g, "\n");
     }
 
-    connectSocket(fileId: string) {
-        if (this.socket) {
-            this.socket.close();
-            this.socket = null;
+    connectFileSocket(fileId: string) {
+        if (this.fileSocket) {
+            this.fileSocket.close();
+            this.fileSocket = null;
         }
 
         this.isRequestingFullSync = false;
         this.updateStatusBar("connecting");
 
         const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
-
-        // Query Params для исправления 403 Forbidden на кириллице
         const url = `${baseUrl}/ws?file_id=${encodeURIComponent(fileId)}&client_id=${encodeURIComponent(this.activeClientId)}`;
 
         try {
-            this.socket = new WebSocket(url);
+            this.fileSocket = new WebSocket(url);
 
-            this.socket.onopen = () => {
-                console.log(`CyberSync: Connected to ${fileId}`);
+            this.fileSocket.onopen = () => {
+                console.log(`CyberSync: File Connected ${fileId}`);
                 this.updateStatusBar("connected");
                 const currentVer = this.getLocalVersion(fileId) || 0;
-
-                this.socket?.send(
+                this.fileSocket?.send(
                     JSON.stringify({
                         type: "handshake",
                         version: Number(currentVer),
@@ -300,17 +452,17 @@ export default class SyncPlugin extends Plugin {
                 );
             };
 
-            this.socket.onclose = () => {
+            this.fileSocket.onclose = () => {
                 this.updateStatusBar("disconnected");
                 this.isRequestingFullSync = false;
             };
 
-            this.socket.onerror = () => {
+            this.fileSocket.onerror = () => {
                 this.updateStatusBar("error");
                 this.isRequestingFullSync = false;
             };
 
-            this.socket.onmessage = async (event) => {
+            this.fileSocket.onmessage = async (event) => {
                 const data = JSON.parse(event.data);
                 const view =
                     this.app.workspace.getActiveViewOfType(MarkdownView);
@@ -319,13 +471,10 @@ export default class SyncPlugin extends Plugin {
                 if (!file) return;
                 const cm = (view.editor as any).cm as EditorView;
 
-                // --- TEXT CHANGE ---
                 if (data.type === "text_change") {
                     if (this.isRequestingFullSync) return;
-
                     const localVer = this.getLocalVersion(file.path);
                     if (data.version && data.version <= localVer) return;
-
                     if (
                         data.clientId === this.activeClientId &&
                         !data.is_history
@@ -340,13 +489,11 @@ export default class SyncPlugin extends Plugin {
                             this.requestFullSync(file.path);
                             return;
                         }
-
                         cm.dispatch({
                             changes: changes,
                             scrollIntoView: !data.is_history,
                             annotations: [RemoteUpdate.of(true)],
                         });
-
                         if (data.version)
                             await this.updateLocalVersion(
                                 file.path,
@@ -357,18 +504,14 @@ export default class SyncPlugin extends Plugin {
                     } finally {
                         if (!data.is_history) this.updateStatusBar("connected");
                     }
-                }
-
-                // --- ACK ---
-                else if (data.type === "ack") {
+                } else if (data.type === "ack") {
                     const ver = Number(data.version || 0);
                     if (ver) {
                         await this.updateLocalVersion(file.path, ver);
-                        // Нормализуем \r\n -> \n перед отправкой
                         const content = this.normalizeText(
                             cm.state.doc.toString(),
                         );
-                        this.socket?.send(
+                        this.fileSocket?.send(
                             JSON.stringify({
                                 type: "snapshot_hint",
                                 version: ver,
@@ -376,12 +519,8 @@ export default class SyncPlugin extends Plugin {
                             }),
                         );
                     }
-                }
-
-                // --- FULL SYNC ---
-                else if (data.type === "full_sync") {
+                } else if (data.type === "full_sync") {
                     this.isRequestingFullSync = false;
-
                     try {
                         const serverContent = this.normalizeText(
                             data.content || "",
@@ -390,15 +529,13 @@ export default class SyncPlugin extends Plugin {
                             cm.state.doc.toString(),
                         );
                         const serverVer = Number(data.version || 0);
-
-                        console.log(
-                            `CyberSync: Applying Full Sync v${serverVer}`,
-                        );
+                        const normalize = (str: string) =>
+                            str.replace(/\s+$/, "");
 
                         if (serverContent === localContent) {
                             await this.updateLocalVersion(file.path, serverVer);
                         } else if (
-                            serverContent.trimEnd() === localContent.trimEnd()
+                            normalize(serverContent) === normalize(localContent)
                         ) {
                             cm.dispatch({
                                 changes: {
@@ -414,20 +551,15 @@ export default class SyncPlugin extends Plugin {
                             const timeSinceEdit =
                                 Date.now() - this.lastLocalChangeTime;
                             const isUserIdle = timeSinceEdit > 3000;
-
                             const serverHasMarkers =
                                 this.hasConflictMarkers(serverContent);
                             const localHasMarkers =
                                 this.hasConflictMarkers(localContent);
 
-                            // Если юзер молчал или это удаленный резолв -> принимаем
                             if (
                                 isUserIdle ||
                                 (!serverHasMarkers && localHasMarkers)
                             ) {
-                                console.log(
-                                    "CyberSync: Overwriting local changes (Idle/Resolution).",
-                                );
                                 cm.dispatch({
                                     changes: {
                                         from: 0,
@@ -442,12 +574,7 @@ export default class SyncPlugin extends Plugin {
                                     serverVer,
                                 );
                             } else {
-                                const conflictText = `<<<<<<< REMOTE (Server v${serverVer})
-${serverContent}
-=======
-${localContent}
->>>>>>> LOCAL (My changes)
-`;
+                                const conflictText = `<<<<<<< REMOTE (Server v${serverVer})\n${serverContent}\n=======\n${localContent}\n>>>>>>> LOCAL (My changes)\n`;
                                 cm.dispatch({
                                     changes: {
                                         from: 0,
@@ -457,7 +584,6 @@ ${localContent}
                                     scrollIntoView: false,
                                     annotations: [RemoteUpdate.of(true)],
                                 });
-
                                 await this.updateLocalVersion(
                                     file.path,
                                     serverVer,
@@ -466,7 +592,6 @@ ${localContent}
                             }
                         }
                     } catch (e) {
-                        console.error("Full sync failed", e);
                     } finally {
                         this.updateStatusBar("connected");
                     }
@@ -494,7 +619,8 @@ ${localContent}
     }
 
     onunload() {
-        if (this.socket) this.socket.close();
+        if (this.fileSocket) this.fileSocket.close();
+        if (this.vaultSocket) this.vaultSocket.close();
     }
 }
 
@@ -502,7 +628,6 @@ class CyberSyncSettingTab extends PluginSettingTab {
     plugin: SyncPlugin;
     constructor(app: App, plugin: SyncPlugin) {
         super(app, plugin);
-        this.plugin = plugin;
     }
     display(): void {
         const { containerEl } = this;
@@ -524,7 +649,7 @@ class CyberSyncSettingTab extends PluginSettingTab {
         );
         new Setting(containerEl)
             .setName("Reset Local Versions")
-            .setDesc("Dangerous: Will force re-download")
+            .setDesc("Dangerous")
             .addButton((btn) =>
                 btn
                     .setButtonText("Reset Cache")

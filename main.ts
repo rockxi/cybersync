@@ -6,6 +6,7 @@ import {
     MarkdownView,
     TFile,
 } from "obsidian";
+
 import {
     Extension,
     StateField,

@@ -87,10 +87,10 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "activeClientId");
     __publicField(this, "color", "#" + Math.floor(Math.random() * 16777215).toString(16));
     __publicField(this, "statusBarItem");
-    // Флаг, чтобы не отправлять свои изменения, пока мы применяем чужие
+    // Флаг: мы применяем изменения программно (не отправлять их обратно)
     __publicField(this, "isApplyingRemoteChange", false);
-    // Флаг, что мы сейчас загружаем историю (чтобы не спамить в консоль)
-    __publicField(this, "isSyncingHistory", false);
+    // Флаг: мы уже запросили Full Sync и ждем ответа (игнорируем ошибки дельт)
+    __publicField(this, "isRequestingFullSync", false);
   }
   async onload() {
     await this.loadSettings();
@@ -175,14 +175,23 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     }
   }
   requestFullSync(fileId) {
+    if (this.isRequestingFullSync) return;
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
     console.log("CyberSync: Requesting Full Sync (Conflict Resolution)...");
+    this.isRequestingFullSync = true;
     this.updateStatusBar("syncing");
     this.socket.send(
       JSON.stringify({
         type: "full_sync"
       })
     );
+    setTimeout(() => {
+      if (this.isRequestingFullSync) {
+        console.warn("CyberSync: Full sync timed out, resetting flag");
+        this.isRequestingFullSync = false;
+        this.updateStatusBar("connected");
+      }
+    }, 5e3);
   }
   async loadSettings() {
     this.settings = Object.assign(
@@ -200,6 +209,8 @@ var SyncPlugin = class extends import_obsidian.Plugin {
       this.socket.close();
       this.socket = null;
     }
+    this.isRequestingFullSync = false;
+    this.isApplyingRemoteChange = false;
     this.updateStatusBar("connecting");
     const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
     const url = `${baseUrl}/ws/${encodeURIComponent(fileId)}/${encodeURIComponent(this.activeClientId)}`;
@@ -222,9 +233,11 @@ var SyncPlugin = class extends import_obsidian.Plugin {
       };
       this.socket.onclose = () => {
         this.updateStatusBar("disconnected");
+        this.isRequestingFullSync = false;
       };
       this.socket.onerror = () => {
         this.updateStatusBar("error");
+        this.isRequestingFullSync = false;
       };
       this.socket.onmessage = async (event) => {
         var _a;
@@ -235,6 +248,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
         if (!file) return;
         const cm = view.editor.cm;
         if (data.type === "text_change") {
+          if (this.isRequestingFullSync) return;
           if (data.clientId === this.activeClientId && !data.is_history)
             return;
           this.isApplyingRemoteChange = true;
@@ -243,7 +257,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
             const changes = import_state.ChangeSet.fromJSON(data.changes);
             if (changes.length !== cm.state.doc.length) {
               console.warn(
-                `CyberSync: Document length mismatch! Remote expects ${changes.length}, local is ${cm.state.doc.length}. Requesting Full Sync.`
+                `CyberSync: Mismatch! Remote len ${changes.length} != Local ${cm.state.doc.length}.`
               );
               this.requestFullSync(file.path);
               return;
@@ -259,14 +273,12 @@ var SyncPlugin = class extends import_obsidian.Plugin {
               );
             }
           } catch (e) {
-            console.error(
-              "CyberSync: Failed to apply remote change (RangeError?)",
-              e
-            );
+            console.error("CyberSync: Failed to apply delta", e);
             this.requestFullSync(file.path);
           } finally {
             this.isApplyingRemoteChange = false;
-            if (data.is_history) this.updateStatusBar("connected");
+            if (data.is_history && !this.isRequestingFullSync)
+              this.updateStatusBar("connected");
           }
         } else if (data.type === "ack") {
           const ver = Number(data.version || 0);
@@ -282,6 +294,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
             );
           }
         } else if (data.type === "full_sync") {
+          this.isRequestingFullSync = false;
           this.isApplyingRemoteChange = true;
           try {
             const serverContent = data.content || "";
@@ -289,9 +302,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
             const serverVer = Number(data.version || 0);
             if (serverContent === localContent) {
               await this.updateLocalVersion(file.path, serverVer);
-              console.log(
-                "CyberSync: Full sync content matches, version updated."
-              );
+              console.log("CyberSync: Full sync matched.");
             } else {
               const conflictText = `<<<<<<< REMOTE (Server v${serverVer})
 ${serverContent}
@@ -308,9 +319,7 @@ ${localContent}
                 scrollIntoView: false
               });
               await this.updateLocalVersion(file.path, serverVer);
-              new import_obsidian.Notice(
-                "CyberSync: Conflict detected! Merged with markers."
-              );
+              new import_obsidian.Notice("CyberSync: Conflict merged.");
             }
           } catch (e) {
             console.error(
@@ -338,6 +347,7 @@ ${localContent}
       };
     } catch (e) {
       this.updateStatusBar("error");
+      this.isRequestingFullSync = false;
     }
   }
   onunload() {
@@ -360,15 +370,13 @@ var CyberSyncSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Client ID").setDesc("Nickname for sync").addText(
+    new import_obsidian.Setting(containerEl).setName("Client ID").addText(
       (text) => text.setValue(this.plugin.settings.clientId).onChange(async (v) => {
         this.plugin.settings.clientId = v;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Reset Local Versions").setDesc(
-      "Dangerous: Will force re-download of history on next open"
-    ).addButton(
+    new import_obsidian.Setting(containerEl).setName("Reset Local Versions").setDesc("Dangerous: Will force re-download").addButton(
       (btn) => btn.setButtonText("Reset Cache").setWarning().onClick(async () => {
         this.plugin.settings.fileVersions = {};
         await this.plugin.saveSettings();

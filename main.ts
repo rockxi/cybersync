@@ -104,10 +104,10 @@ export default class SyncPlugin extends Plugin {
     color: string = "#" + Math.floor(Math.random() * 16777215).toString(16);
     statusBarItem: HTMLElement;
 
-    // Флаг, чтобы не отправлять свои изменения, пока мы применяем чужие
+    // Флаг: мы применяем изменения программно (не отправлять их обратно)
     private isApplyingRemoteChange = false;
-    // Флаг, что мы сейчас загружаем историю (чтобы не спамить в консоль)
-    private isSyncingHistory = false;
+    // Флаг: мы уже запросили Full Sync и ждем ответа (игнорируем ошибки дельт)
+    private isRequestingFullSync = false;
 
     async onload() {
         await this.loadSettings();
@@ -163,19 +163,17 @@ export default class SyncPlugin extends Plugin {
 
         this.registerEditorExtension([cursorField, syncExtension]);
 
-        // При открытии файла подключаемся
         this.app.workspace.on("file-open", (file) => {
             if (file) this.connectSocket(file.path);
         });
 
-        // Если файл уже открыт при старте
         const activeFile = this.app.workspace.getActiveFile();
         if (activeFile) this.connectSocket(activeFile.path);
     }
 
     async updateLocalVersion(filePath: string, version: number) {
         this.settings.fileVersions[filePath] = version;
-        await this.saveSettings(); // Сохраняем в файл, чтобы пережить перезапуск
+        await this.saveSettings();
     }
 
     getLocalVersion(filePath: string): number {
@@ -226,14 +224,29 @@ export default class SyncPlugin extends Plugin {
     }
 
     requestFullSync(fileId: string) {
+        // Блокировка повторных запросов
+        if (this.isRequestingFullSync) return;
+
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+
         console.log("CyberSync: Requesting Full Sync (Conflict Resolution)...");
+        this.isRequestingFullSync = true;
         this.updateStatusBar("syncing");
+
         this.socket.send(
             JSON.stringify({
                 type: "full_sync",
             }),
         );
+
+        // Сброс флага через 5 сек на всякий случай, если сервер не ответил
+        setTimeout(() => {
+            if (this.isRequestingFullSync) {
+                console.warn("CyberSync: Full sync timed out, resetting flag");
+                this.isRequestingFullSync = false;
+                this.updateStatusBar("connected");
+            }
+        }, 5000);
     }
 
     async loadSettings() {
@@ -242,7 +255,6 @@ export default class SyncPlugin extends Plugin {
             DEFAULT_SETTINGS,
             await this.loadData(),
         );
-        // Инициализируем объект версий если он пуст
         if (!this.settings.fileVersions) this.settings.fileVersions = {};
     }
 
@@ -256,6 +268,10 @@ export default class SyncPlugin extends Plugin {
             this.socket = null;
         }
 
+        // Сбрасываем флаги при новом подключении
+        this.isRequestingFullSync = false;
+        this.isApplyingRemoteChange = false;
+
         this.updateStatusBar("connecting");
         const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
         const url = `${baseUrl}/ws/${encodeURIComponent(fileId)}/${encodeURIComponent(this.activeClientId)}`;
@@ -267,7 +283,6 @@ export default class SyncPlugin extends Plugin {
                 console.log(`CyberSync: Connected to ${fileId}`);
                 this.updateStatusBar("connected");
 
-                // --- HANDSHAKE ---
                 const currentVer = this.getLocalVersion(fileId) || 0;
                 console.log(
                     `CyberSync: Sending handshake for ${fileId}, local version: ${currentVer}`,
@@ -283,10 +298,12 @@ export default class SyncPlugin extends Plugin {
 
             this.socket.onclose = () => {
                 this.updateStatusBar("disconnected");
+                this.isRequestingFullSync = false;
             };
 
             this.socket.onerror = () => {
                 this.updateStatusBar("error");
+                this.isRequestingFullSync = false;
             };
 
             this.socket.onmessage = async (event) => {
@@ -296,11 +313,14 @@ export default class SyncPlugin extends Plugin {
                 if (!view) return;
 
                 const file = view.file;
-                if (!file) return; // Защита если файл закрыли
+                if (!file) return;
                 const cm = (view.editor as any).cm as EditorView;
 
-                // --- ОБРАБОТКА ИЗМЕНЕНИЙ (Delta) ---
+                // --- TEXT CHANGE ---
                 if (data.type === "text_change") {
+                    // Если мы уже запросили Full Sync, игнорируем любые дельты, чтобы не спамить
+                    if (this.isRequestingFullSync) return;
+
                     if (
                         data.clientId === this.activeClientId &&
                         !data.is_history
@@ -313,13 +333,12 @@ export default class SyncPlugin extends Plugin {
                     try {
                         const changes = ChangeSet.fromJSON(data.changes);
 
-                        // ПРОВЕРКА ЦЕЛОСТНОСТИ: Совпадает ли длина документа?
                         if (changes.length !== cm.state.doc.length) {
                             console.warn(
-                                `CyberSync: Document length mismatch! Remote expects ${changes.length}, local is ${cm.state.doc.length}. Requesting Full Sync.`,
+                                `CyberSync: Mismatch! Remote len ${changes.length} != Local ${cm.state.doc.length}.`,
                             );
                             this.requestFullSync(file.path);
-                            return; // Прерываем обработку, ждем full_sync
+                            return;
                         }
 
                         cm.dispatch({
@@ -334,26 +353,22 @@ export default class SyncPlugin extends Plugin {
                             );
                         }
                     } catch (e) {
-                        console.error(
-                            "CyberSync: Failed to apply remote change (RangeError?)",
-                            e,
-                        );
-                        // Если CodeMirror выбросил ошибку при применении - тоже запрашиваем Full Sync
+                        console.error("CyberSync: Failed to apply delta", e);
+                        // Ошибка применения -> запрашиваем Full Sync
                         this.requestFullSync(file.path);
                     } finally {
                         this.isApplyingRemoteChange = false;
-                        if (data.is_history) this.updateStatusBar("connected");
+                        if (data.is_history && !this.isRequestingFullSync)
+                            this.updateStatusBar("connected");
                     }
                 }
 
-                // --- ПОДТВЕРЖДЕНИЕ ЗАПИСИ (ACK) ---
+                // --- ACK ---
                 else if (data.type === "ack") {
                     const ver = Number(data.version || 0);
                     if (ver) {
                         await this.updateLocalVersion(file.path, ver);
-
-                        // SNAPSHOT HINT: Отправляем серверу полный текст, чтобы он обновил бэкап
-                        // Это нужно, чтобы сервер всегда мог отдать "full_sync"
+                        // Шлем снапшот на сервер, чтобы он обновил backup
                         const content = cm.state.doc.toString();
                         this.socket?.send(
                             JSON.stringify({
@@ -365,29 +380,27 @@ export default class SyncPlugin extends Plugin {
                     }
                 }
 
-                // --- FULL SYNC (Решение конфликтов) ---
+                // --- FULL SYNC ---
                 else if (data.type === "full_sync") {
+                    // Мы получили Full Sync - сбрасываем флаг блокировки
+                    this.isRequestingFullSync = false;
                     this.isApplyingRemoteChange = true;
+
                     try {
                         const serverContent = data.content || "";
                         const localContent = cm.state.doc.toString();
                         const serverVer = Number(data.version || 0);
 
-                        // Если контент совпадает, просто обновляем версию
                         if (serverContent === localContent) {
                             await this.updateLocalVersion(file.path, serverVer);
-                            console.log(
-                                "CyberSync: Full sync content matches, version updated.",
-                            );
+                            console.log("CyberSync: Full sync matched.");
                         } else {
-                            // КОНФЛИКТ: Вставляем маркеры как в Git
                             const conflictText = `<<<<<<< REMOTE (Server v${serverVer})
 ${serverContent}
 =======
 ${localContent}
 >>>>>>> LOCAL (My changes)
 `;
-                            // Заменяем весь текст на блок с конфликтом
                             cm.dispatch({
                                 changes: {
                                     from: 0,
@@ -397,11 +410,8 @@ ${localContent}
                                 scrollIntoView: false,
                             });
 
-                            // Принимаем версию сервера как базу
                             await this.updateLocalVersion(file.path, serverVer);
-                            new Notice(
-                                "CyberSync: Conflict detected! Merged with markers.",
-                            );
+                            new Notice("CyberSync: Conflict merged.");
                         }
                     } catch (e) {
                         console.error(
@@ -414,7 +424,7 @@ ${localContent}
                     }
                 }
 
-                // --- КУРСОРЫ ---
+                // --- CURSOR ---
                 else if (data.type === "cursor") {
                     if (data.clientId === this.activeClientId) return;
                     cm.dispatch({
@@ -432,6 +442,7 @@ ${localContent}
             };
         } catch (e) {
             this.updateStatusBar("error");
+            this.isRequestingFullSync = false;
         }
     }
 
@@ -458,23 +469,15 @@ class CyberSyncSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }),
         );
-        new Setting(containerEl)
-            .setName("Client ID")
-            .setDesc("Nickname for sync")
-            .addText((text) =>
-                text
-                    .setValue(this.plugin.settings.clientId)
-                    .onChange(async (v) => {
-                        this.plugin.settings.clientId = v;
-                        await this.plugin.saveSettings();
-                    }),
-            );
-
+        new Setting(containerEl).setName("Client ID").addText((text) =>
+            text.setValue(this.plugin.settings.clientId).onChange(async (v) => {
+                this.plugin.settings.clientId = v;
+                await this.plugin.saveSettings();
+            }),
+        );
         new Setting(containerEl)
             .setName("Reset Local Versions")
-            .setDesc(
-                "Dangerous: Will force re-download of history on next open",
-            )
+            .setDesc("Dangerous: Will force re-download")
             .addButton((btn) =>
                 btn
                     .setButtonText("Reset Cache")

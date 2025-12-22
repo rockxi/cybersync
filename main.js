@@ -102,6 +102,8 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "color", "#" + Math.floor(Math.random() * 16777215).toString(16));
     __publicField(this, "statusBarItem");
     __publicField(this, "isRequestingFullSync", false);
+    // ВРЕМЯ ПОСЛЕДНЕГО ЛОКАЛЬНОГО ВВОДА (ДЛЯ РЕШЕНИЯ КОНФЛИКТОВ)
+    __publicField(this, "lastLocalChangeTime", 0);
   }
   async onload() {
     await this.loadSettings();
@@ -121,6 +123,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
           return;
         }
         if (update.docChanged) {
+          pluginInstance.lastLocalChangeTime = Date.now();
           pluginInstance.socket.send(
             JSON.stringify({
               type: "text_change",
@@ -215,7 +218,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
   hasConflictMarkers(text) {
     return /^<<<<<<< REMOTE \(Server v\d+\)/m.test(text);
   }
-  // --- НОРМАЛИЗАЦИЯ (LF) ---
   normalizeText(text) {
     return text.replace(/\r\n/g, "\n");
   }
@@ -316,7 +318,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
             );
             if (serverContent === localContent) {
               await this.updateLocalVersion(file.path, serverVer);
-              console.log("CyberSync: Full sync matched.");
             } else if (serverContent.trimEnd() === localContent.trimEnd()) {
               cm.dispatch({
                 changes: {
@@ -329,9 +330,14 @@ var SyncPlugin = class extends import_obsidian.Plugin {
               });
               await this.updateLocalVersion(file.path, serverVer);
             } else {
+              const timeSinceEdit = Date.now() - this.lastLocalChangeTime;
+              const isUserIdle = timeSinceEdit > 3e3;
               const serverHasMarkers = this.hasConflictMarkers(serverContent);
               const localHasMarkers = this.hasConflictMarkers(localContent);
-              if (!serverHasMarkers && localHasMarkers) {
+              if (isUserIdle || !serverHasMarkers && localHasMarkers) {
+                console.log(
+                  "CyberSync: Overwriting local changes (Idle/Resolution)."
+                );
                 cm.dispatch({
                   changes: {
                     from: 0,
@@ -344,9 +350,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
                 await this.updateLocalVersion(
                   file.path,
                   serverVer
-                );
-                new import_obsidian.Notice(
-                  "CyberSync: Conflict resolved remotely."
                 );
               } else {
                 const conflictText = `<<<<<<< REMOTE (Server v${serverVer})
@@ -368,9 +371,7 @@ ${localContent}
                   file.path,
                   serverVer
                 );
-                new import_obsidian.Notice(
-                  "CyberSync: Conflict detected. Resolve manually."
-                );
+                new import_obsidian.Notice("CyberSync: Conflict detected.");
               }
             }
           } catch (e) {

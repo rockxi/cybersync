@@ -123,6 +123,8 @@ export default class SyncPlugin extends Plugin {
     statusBarItem: HTMLElement;
 
     private isRequestingFullSync = false;
+    // ВРЕМЯ ПОСЛЕДНЕГО ЛОКАЛЬНОГО ВВОДА (ДЛЯ РЕШЕНИЯ КОНФЛИКТОВ)
+    private lastLocalChangeTime = 0;
 
     async onload() {
         await this.loadSettings();
@@ -148,6 +150,9 @@ export default class SyncPlugin extends Plugin {
                 }
 
                 if (update.docChanged) {
+                    // Фиксируем время активности пользователя
+                    pluginInstance.lastLocalChangeTime = Date.now();
+
                     pluginInstance.socket.send(
                         JSON.stringify({
                             type: "text_change",
@@ -264,7 +269,6 @@ export default class SyncPlugin extends Plugin {
         return /^<<<<<<< REMOTE \(Server v\d+\)/m.test(text);
     }
 
-    // --- НОРМАЛИЗАЦИЯ (LF) ---
     normalizeText(text: string): string {
         return text.replace(/\r\n/g, "\n");
     }
@@ -361,7 +365,6 @@ export default class SyncPlugin extends Plugin {
                     const ver = Number(data.version || 0);
                     if (ver) {
                         await this.updateLocalVersion(file.path, ver);
-                        // ВАЖНО: Нормализуем перед отправкой!
                         const content = this.normalizeText(
                             cm.state.doc.toString(),
                         );
@@ -392,10 +395,12 @@ export default class SyncPlugin extends Plugin {
                             `CyberSync: Applying Full Sync v${serverVer}`,
                         );
 
+                        // 1. Идеальное совпадение
                         if (serverContent === localContent) {
                             await this.updateLocalVersion(file.path, serverVer);
-                            console.log("CyberSync: Full sync matched.");
-                        } else if (
+                        }
+                        // 2. Незначительные отличия (пробелы)
+                        else if (
                             serverContent.trimEnd() === localContent.trimEnd()
                         ) {
                             cm.dispatch({
@@ -408,13 +413,30 @@ export default class SyncPlugin extends Plugin {
                                 annotations: [RemoteUpdate.of(true)],
                             });
                             await this.updateLocalVersion(file.path, serverVer);
-                        } else {
+                        }
+                        // 3. КОНФЛИКТЫ
+                        else {
+                            // --- ГЛАВНОЕ ИСПРАВЛЕНИЕ ---
+                            // Если пользователь на этом устройстве НЕ печатал последние 3 секунды,
+                            // мы считаем, что он в режиме "Наблюдателя".
+                            // Значит, любые отличия - это просто отставание, а не конфликт.
+                            // Мы просто принимаем версию сервера.
+                            const timeSinceEdit =
+                                Date.now() - this.lastLocalChangeTime;
+                            const isUserIdle = timeSinceEdit > 3000; // 3 секунды тишины
+
                             const serverHasMarkers =
                                 this.hasConflictMarkers(serverContent);
                             const localHasMarkers =
                                 this.hasConflictMarkers(localContent);
 
-                            if (!serverHasMarkers && localHasMarkers) {
+                            if (
+                                isUserIdle ||
+                                (!serverHasMarkers && localHasMarkers)
+                            ) {
+                                console.log(
+                                    "CyberSync: Overwriting local changes (Idle/Resolution).",
+                                );
                                 cm.dispatch({
                                     changes: {
                                         from: 0,
@@ -428,10 +450,8 @@ export default class SyncPlugin extends Plugin {
                                     file.path,
                                     serverVer,
                                 );
-                                new Notice(
-                                    "CyberSync: Conflict resolved remotely.",
-                                );
                             } else {
+                                // Юзер активно печатал и тексты разные -> РЕАЛЬНЫЙ конфликт
                                 const conflictText = `<<<<<<< REMOTE (Server v${serverVer})
 ${serverContent}
 =======
@@ -452,9 +472,7 @@ ${localContent}
                                     file.path,
                                     serverVer,
                                 );
-                                new Notice(
-                                    "CyberSync: Conflict detected. Resolve manually.",
-                                );
+                                new Notice("CyberSync: Conflict detected.");
                             }
                         }
                     } catch (e) {

@@ -154,41 +154,27 @@ export default class SyncPlugin extends Plugin {
     }
 
     connectSocket(fileId: string) {
-        if (this.socket) this.socket.close();
+        if (this.socket) {
+            this.socket.close();
+            this.socket = null;
+        }
 
-        // --- ИСПОЛЬЗУЕМ URL ИЗ НАСТРОЕК ---
-        // Убираем trailing slash если пользователь случайно добавил
-        const serverUrl = this.settings.serverUrl.replace(/\/$/, "");
+        // 1. Берем базовый URL из настроек (убираем слеш в конце)
+        const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
 
-        // ВАЖНО: Мы меняем структуру URL, чтобы она работала с Python сервером
-        // Старый (твой рабочий): `ws://localhost:8000/ws/${encodedId}/${this.clientId}`
-        // Новый (с настройкой): `${serverUrl}/ws/${this.clientId}/${fileId}`
-
-        // Если ты хочешь оставить ТОЧНО КАК БЫЛО, но с настройкой хоста:
+        // 2. Кодируем ID файла, как это было в рабочем коде
         const encodedId = encodeURIComponent(fileId);
-        // Мы берем из настроек ws://localhost:8000 и добавляем путь
-        // Но лучше использовать формат serverUrl/ws/...
 
-        // Вариант 1: Сохраняем твою логику (encodedId в середине), но берем хост из настроек
-        // Это предполагает, что serverUrl = "ws://localhost:8000"
-
-        // Используем новую схему роутинга {client_id}/{file_path}, которую мы обсуждали для фикса 403
-        // или старую, если ты уверен, что она работает.
-
-        // Давай сделаем универсально, предполагая, что ты пофиксил роутер на сервере (как мы обсуждали):
-        // ws://host:port/ws/{client_id}/{file_path}
-        // (без encodeURIComponent для всего пути, чтобы слеши работали)
-
-        const url = `${serverUrl}/ws/${this.clientId}/${fileId}`;
-
-        // ЕСЛИ у тебя старый сервер (где encodedId), используй это:
-        // const url = `${serverUrl}/ws/${encodeURIComponent(fileId)}/${this.clientId}`;
+        // 3. Формируем URL в формате, который ожидает твой ТЕКУЩИЙ сервер:
+        // /ws/{FILE_ID}/{CLIENT_ID}
+        const url = `${baseUrl}/ws/${encodedId}/${this.clientId}`;
 
         console.log("Connecting to:", url);
 
         try {
             this.socket = new WebSocket(url);
 
+            // ... (остальной код обработчиков без изменений)
             this.socket.onopen = () => console.log("CyberSync connected");
 
             this.socket.onmessage = (event) => {
@@ -197,6 +183,7 @@ export default class SyncPlugin extends Plugin {
                     this.app.workspace.getActiveViewOfType(MarkdownView);
                 if (!view) return;
 
+                // Фильтр своего эха
                 if (data.clientId === this.clientId) return;
 
                 if (data.type === "cursor") {

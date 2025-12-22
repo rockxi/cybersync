@@ -137,10 +137,13 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     }
   }
   connectSocket(fileId) {
-    if (this.socket) this.socket.close();
-    const serverUrl = this.settings.serverUrl.replace(/\/$/, "");
+    if (this.socket) {
+      this.socket.close();
+      this.socket = null;
+    }
+    const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
     const encodedId = encodeURIComponent(fileId);
-    const url = `${serverUrl}/ws/${this.clientId}/${fileId}`;
+    const url = `${baseUrl}/ws/${encodedId}/${this.clientId}`;
     console.log("Connecting to:", url);
     try {
       this.socket = new WebSocket(url);

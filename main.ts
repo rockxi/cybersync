@@ -7,7 +7,6 @@ import {
     TFile,
     Notice,
 } from "obsidian";
-
 import {
     Extension,
     StateField,
@@ -38,9 +37,11 @@ const DEFAULT_SETTINGS: CyberSyncSettings = {
     fileVersions: {},
 };
 
+// Аннотация для пометки изменений, пришедших с сервера
+// (чтобы не отправлять их обратно как "пользовательский ввод")
 const RemoteUpdate = Annotation.define<boolean>();
 
-// --- ТИПЫ ДАННЫХ ---
+// --- ТИПЫ ДАННЫХ ДЛЯ КУРСОРОВ ---
 interface CursorPosition {
     pos: number;
     clientId: string;
@@ -70,25 +71,24 @@ class CursorWidget extends WidgetType {
     }
 }
 
-// --- ИСПРАВЛЕННЫЙ CURSOR FIELD ---
+// Поле состояния для отрисовки курсоров
 const cursorField = StateField.define<DecorationSet>({
     create() {
         return Decoration.none;
     },
     update(cursors, tr) {
-        // ЗАЩИТА ОТ КРАША ПРИ FULL SYNC
+        // ЗАЩИТА: Оборачиваем маппинг в try-catch
+        // При Full Sync документ меняется полностью, и старые координаты курсоров
+        // могут вызвать RangeError. В этом случае просто сбрасываем курсоры.
         try {
             cursors = cursors.map(tr.changes);
         } catch (e) {
-            // Если документ изменился настолько радикально (Full Sync),
-            // что маппинг ломается - просто сбрасываем курсоры.
-            // Это лучше, чем краш всего плагина.
             return Decoration.none;
         }
 
         for (let e of tr.effects) {
             if (e.is(updateCursorEffect)) {
-                // Еще одна защита: проверяем, что позиция курсора валидна для текущего документа
+                // Доп. защита координат
                 if (e.value.pos > tr.newDoc.length) continue;
 
                 const deco = Decoration.widget({
@@ -138,6 +138,7 @@ export default class SyncPlugin extends Plugin {
                 if (pluginInstance.socket?.readyState !== WebSocket.OPEN)
                     return;
 
+                // 1. Если это изменение пришло с сервера (аннотация), игнорируем
                 if (
                     update.transactions.some((tr) =>
                         tr.annotation(RemoteUpdate),
@@ -146,6 +147,7 @@ export default class SyncPlugin extends Plugin {
                     return;
                 }
 
+                // 2. Если документ изменился пользователем
                 if (update.docChanged) {
                     pluginInstance.socket.send(
                         JSON.stringify({
@@ -156,7 +158,9 @@ export default class SyncPlugin extends Plugin {
                     );
                 }
 
+                // 3. Курсоры
                 if (update.selectionSet) {
+                    // Не шлем движение курсора, если оно вызвано вставкой текста с сервера
                     if (
                         !update.transactions.some((tr) =>
                             tr.annotation(RemoteUpdate),
@@ -310,12 +314,12 @@ export default class SyncPlugin extends Plugin {
                 if (!file) return;
                 const cm = (view.editor as any).cm as EditorView;
 
-                // --- TEXT CHANGE ---
+                // --- TEXT CHANGE (DELTA) ---
                 if (data.type === "text_change") {
                     if (this.isRequestingFullSync) return;
 
                     const localVer = this.getLocalVersion(file.path);
-                    if (data.version && data.version <= localVer) return;
+                    if (data.version && data.version <= localVer) return; // Игнор старых
 
                     if (
                         data.clientId === this.activeClientId &&
@@ -335,6 +339,7 @@ export default class SyncPlugin extends Plugin {
                             return;
                         }
 
+                        // ВАЖНО: Добавляем аннотацию RemoteUpdate!
                         cm.dispatch({
                             changes: changes,
                             scrollIntoView: !data.is_history,
@@ -379,20 +384,24 @@ export default class SyncPlugin extends Plugin {
                         const localContent = cm.state.doc.toString();
                         const serverVer = Number(data.version || 0);
 
-                        console.log(`CyberSync: Applying Full Sync v${serverVer}`);
+                        console.log(
+                            `CyberSync: Applying Full Sync v${serverVer}`,
+                        );
 
-                        // Хелпер для удаления пустоты в конце (пробелы и переносы)
-                        const normalize = (str: string) => str.replace(/\s+$/, "");
+                        // Хелпер: удаляем пробелы/переносы в конце для сравнения
+                        const normalize = (str: string) =>
+                            str.replace(/\s+$/, "");
 
-                        // 1. Полное совпадение
+                        // 1. Идеальное совпадение
                         if (serverContent === localContent) {
-                             await this.updateLocalVersion(file.path, serverVer);
-                             console.log("CyberSync: Full sync matched exactly.");
+                            await this.updateLocalVersion(file.path, serverVer);
+                            console.log("CyberSync: Full sync matched.");
                         }
-                        // 2. Совпадение по смыслу (отличие только в переносах строк в конце)
-                        // В этом случае НЕ показываем конфликт, а просто молча накатываем версию сервера
-                        else if (normalize(serverContent) === normalize(localContent)) {
-                            console.log("CyberSync: Trailing newline mismatch. Auto-fixing.");
+                        // 2. Совпадение по смыслу (только хвост отличается) -> Автофикс без конфликтов
+                        else if (
+                            normalize(serverContent) === normalize(localContent)
+                        ) {
+                            console.log("CyberSync: Trailing newline fix.");
                             cm.dispatch({
                                 changes: {
                                     from: 0,
@@ -400,17 +409,22 @@ export default class SyncPlugin extends Plugin {
                                     insert: serverContent,
                                 },
                                 scrollIntoView: false,
-                                annotations: [RemoteUpdate.of(true)]
+                                annotations: [RemoteUpdate.of(true)],
                             });
                             await this.updateLocalVersion(file.path, serverVer);
                         }
-                        // 3. Реальный конфликт
+                        // 3. Реальный конфликт или авто-резолв конфликтов
                         else {
-                            const serverHasMarkers = this.hasConflictMarkers(serverContent);
-                            const localHasMarkers = this.hasConflictMarkers(localContent);
+                            const serverHasMarkers =
+                                this.hasConflictMarkers(serverContent);
+                            const localHasMarkers =
+                                this.hasConflictMarkers(localContent);
 
+                            // Если сервер чист, а мы в конфликте -> Сервер победил, это резолв
                             if (!serverHasMarkers && localHasMarkers) {
-                                console.log("CyberSync: Detected resolution from server. Overwriting local conflicts.");
+                                console.log(
+                                    "CyberSync: Remote resolved conflict.",
+                                );
                                 cm.dispatch({
                                     changes: {
                                         from: 0,
@@ -418,14 +432,19 @@ export default class SyncPlugin extends Plugin {
                                         insert: serverContent,
                                     },
                                     scrollIntoView: false,
-                                    annotations: [RemoteUpdate.of(true)]
+                                    annotations: [RemoteUpdate.of(true)],
                                 });
-                                await this.updateLocalVersion(file.path, serverVer);
-                                new Notice("CyberSync: Conflict resolved remotely.");
+                                await this.updateLocalVersion(
+                                    file.path,
+                                    serverVer,
+                                );
+                                new Notice(
+                                    "CyberSync: Conflict resolved remotely.",
+                                );
                             }
+                            // Иначе -> Рисуем маркеры
                             else {
-                                const conflictText =
-`<<<<<<< REMOTE (Server v${serverVer})
+                                const conflictText = `<<<<<<< REMOTE (Server v${serverVer})
 ${serverContent}
 =======
 ${localContent}
@@ -438,11 +457,16 @@ ${localContent}
                                         insert: conflictText,
                                     },
                                     scrollIntoView: false,
-                                    annotations: [RemoteUpdate.of(true)]
+                                    annotations: [RemoteUpdate.of(true)],
                                 });
 
-                                await this.updateLocalVersion(file.path, serverVer);
-                                new Notice("CyberSync: Conflict detected. Resolve manually.");
+                                await this.updateLocalVersion(
+                                    file.path,
+                                    serverVer,
+                                );
+                                new Notice(
+                                    "CyberSync: Conflict detected. Resolve manually.",
+                                );
                             }
                         }
                     } catch (e) {
@@ -450,7 +474,6 @@ ${localContent}
                     } finally {
                         this.updateStatusBar("connected");
                     }
-                }
                 } else if (data.type === "cursor") {
                     if (data.clientId === this.activeClientId) return;
                     cm.dispatch({

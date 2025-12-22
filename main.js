@@ -301,15 +301,28 @@ var SyncPlugin = class extends import_obsidian.Plugin {
             console.log(
               `CyberSync: Applying Full Sync v${serverVer}`
             );
+            const normalize = (str) => str.replace(/\s+$/, "");
             if (serverContent === localContent) {
               await this.updateLocalVersion(file.path, serverVer);
               console.log("CyberSync: Full sync matched.");
+            } else if (normalize(serverContent) === normalize(localContent)) {
+              console.log("CyberSync: Trailing newline fix.");
+              cm.dispatch({
+                changes: {
+                  from: 0,
+                  to: localContent.length,
+                  insert: serverContent
+                },
+                scrollIntoView: false,
+                annotations: [RemoteUpdate.of(true)]
+              });
+              await this.updateLocalVersion(file.path, serverVer);
             } else {
               const serverHasMarkers = this.hasConflictMarkers(serverContent);
               const localHasMarkers = this.hasConflictMarkers(localContent);
               if (!serverHasMarkers && localHasMarkers) {
                 console.log(
-                  "CyberSync: Detected resolution from server. Overwriting local conflicts."
+                  "CyberSync: Remote resolved conflict."
                 );
                 cm.dispatch({
                   changes: {

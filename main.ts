@@ -120,7 +120,6 @@ export default class SyncPlugin extends Plugin {
     fileSocket: WebSocket | null = null;
     vaultSocket: WebSocket | null = null;
 
-    // Очередь для сообщений Vault (если сокет не готов)
     private vaultMessageQueue: string[] = [];
 
     activeClientId: string;
@@ -137,15 +136,33 @@ export default class SyncPlugin extends Plugin {
         await this.loadSettings();
         this.updateActiveClientId();
 
+        // 1. Создаем статус бар
         this.statusBarItem = this.addStatusBarItem();
-        this.updateStatusBar("disconnected");
+        this.statusBarItem.addClass("cybersync-statusbar");
+        // Делаем курсор "рукой", чтобы было понятно, что можно нажать
+        this.statusBarItem.style.cursor = "pointer";
+        this.statusBarItem.title = "Click to Reconnect";
+
+        // 2. ОБРАБОТЧИК НАЖАТИЯ: Переподключение
+        this.statusBarItem.addEventListener("click", async () => {
+            await this.forceReconnect();
+        });
+
+        // 3. ИНТЕРВАЛ ОБНОВЛЕНИЯ: Каждые 5 секунд проверяем реальное состояние
+        this.registerInterval(
+            window.setInterval(() => {
+                this.updateStatusBar();
+            }, 5000),
+        );
+
+        this.updateStatusBar("disconnected"); // Начальное состояние
 
         this.addSettingTab(new CyberSyncSettingTab(this.app, this));
 
-        // 1. Сразу пробуем подключить Vault Socket
+        // 4. Подключение
         this.connectVaultSocket();
 
-        // 2. Регистрируем события Vault
+        // 5. События
         this.registerEvent(
             this.app.vault.on("create", (file) => this.onLocalFileCreate(file)),
         );
@@ -158,7 +175,6 @@ export default class SyncPlugin extends Plugin {
             ),
         );
 
-        // 3. Text Sync logic
         const pluginInstance = this;
         const syncExtension = EditorView.updateListener.of(
             (update: ViewUpdate) => {
@@ -206,14 +222,100 @@ export default class SyncPlugin extends Plugin {
 
         this.app.workspace.on("file-open", (file) => {
             if (file) this.connectFileSocket(file.path);
-            else if (this.fileSocket) {
-                this.fileSocket.close();
+            else {
+                if (this.fileSocket) this.fileSocket.close();
                 this.fileSocket = null;
+                this.updateStatusBar(); // Обновляем статус, т.к. файл закрылся
             }
         });
 
         const activeFile = this.app.workspace.getActiveFile();
         if (activeFile) this.connectFileSocket(activeFile.path);
+    }
+
+    // --- ЛОГИКА ПЕРЕПОДКЛЮЧЕНИЯ ---
+    async forceReconnect() {
+        new Notice("CyberSync: Reconnecting...");
+        console.log("CyberSync: Force Reconnect requested by user.");
+
+        // Закрываем всё жестко
+        if (this.vaultSocket) {
+            this.vaultSocket.close();
+            this.vaultSocket = null;
+        }
+        if (this.fileSocket) {
+            this.fileSocket.close();
+            this.fileSocket = null;
+        }
+
+        this.updateStatusBar("disconnected");
+
+        // Ждем немного для чистоты эксперимента
+        setTimeout(() => {
+            this.connectVaultSocket();
+            const activeFile = this.app.workspace.getActiveFile();
+            if (activeFile) this.connectFileSocket(activeFile.path);
+        }, 500);
+    }
+
+    // --- ОБНОВЛЕННЫЙ СТАТУС БАР ---
+    // Теперь принимает необязательный аргумент.
+    // Если аргумент не передан, вычисляет статус на основе состояния сокетов.
+    updateStatusBar(forceStatus?: string) {
+        this.statusBarItem.empty();
+        const icon = this.statusBarItem.createSpan({
+            cls: "cybersync-status-icon",
+        });
+
+        let text = "";
+        let color = "";
+
+        // Если передан явный статус (например, "syncing" при передаче данных)
+        if (forceStatus) {
+            if (forceStatus === "connected") {
+                text = "● CyberSync: OK";
+                color = "var(--text-success)";
+            } else if (forceStatus === "syncing") {
+                text = "↻ CyberSync: Sync";
+                color = "var(--text-warning)";
+            } else if (forceStatus === "error") {
+                text = "× CyberSync: Err";
+                color = "var(--text-error)";
+            } else {
+                text = "● CyberSync: Off";
+                color = "var(--text-muted)";
+            }
+        }
+        // Иначе определяем автоматически (для интервала 5 сек)
+        else {
+            const vaultReady = this.vaultSocket?.readyState === WebSocket.OPEN;
+            const fileReady = this.fileSocket?.readyState === WebSocket.OPEN;
+            const hasActiveFile = this.app.workspace.getActiveFile() !== null;
+
+            if (vaultReady && (fileReady || !hasActiveFile)) {
+                // Всё отлично: Глобал есть, Файл есть (или файл не открыт)
+                text = "● CyberSync: OK";
+                color = "var(--text-success)";
+            } else if (vaultReady && hasActiveFile && !fileReady) {
+                // Глобал есть, но файл отвалился
+                text = "● CyberSync: No File";
+                color = "var(--text-warning)";
+            } else if (!vaultReady && fileReady) {
+                // Странная ситуация, но допустим
+                text = "● CyberSync: No Vault";
+                color = "var(--text-warning)";
+            } else if (!vaultReady && !fileReady) {
+                // Всё плохо
+                text = "× CyberSync: Off";
+                color = "var(--text-muted)";
+            } else {
+                text = "● CyberSync: Check";
+                color = "var(--text-muted)";
+            }
+        }
+
+        icon.setText(text);
+        icon.style.color = color;
     }
 
     // --- VAULT EVENTS ---
@@ -267,10 +369,9 @@ export default class SyncPlugin extends Plugin {
     // --- VAULT SOCKET CONNECTION ---
     connectVaultSocket() {
         const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
-        // Важно: file_id=__global__
-        const url = `${baseUrl}/ws?file_id=__global__&client_id=${encodeURIComponent(this.activeClientId)}`;
+        const url = `${baseUrl}/ws?file_id=__global__&client_id=${encodeURIComponent(this.activeClientId)}&t=${Date.now()}`;
 
-        console.log("CyberSync: Connecting to Vault Socket...", url);
+        console.log("CyberSync: 🌍 Connecting to Vault Socket...", url);
 
         try {
             if (this.vaultSocket) {
@@ -280,8 +381,10 @@ export default class SyncPlugin extends Plugin {
             this.vaultSocket = new WebSocket(url);
 
             this.vaultSocket.onopen = () => {
-                console.log("CyberSync: ✅ Connected to Global Vault!");
-                // Отправляем все накопившиеся сообщения
+                console.log("CyberSync: 🌍✅ Connected to Global Vault!");
+                // new Notice("CyberSync: Global Connected"); // Можно убрать, если мешает
+                this.updateStatusBar(); // Сразу обновим статус
+
                 while (this.vaultMessageQueue.length > 0) {
                     const msg = this.vaultMessageQueue.shift();
                     if (msg) this.vaultSocket?.send(msg);
@@ -293,7 +396,7 @@ export default class SyncPlugin extends Plugin {
                 if (data.clientId === this.activeClientId) return;
 
                 console.log(
-                    "CyberSync: Received Vault Event:",
+                    "CyberSync: 🌍 Received Vault Event:",
                     data.type,
                     data.path,
                 );
@@ -357,16 +460,29 @@ export default class SyncPlugin extends Plugin {
                 }
             };
 
-            this.vaultSocket.onclose = () => {
-                console.warn("CyberSync: Vault Socket closed. Retry in 5s...");
-                setTimeout(() => this.connectVaultSocket(), 5000);
+            this.vaultSocket.onclose = (ev) => {
+                console.warn(
+                    `CyberSync: 🌍 Vault Socket closed. Retry in 5s...`,
+                );
+                this.updateStatusBar(); // Обновим статус на красный/серый
+                setTimeout(() => {
+                    // Проверяем, не переподключились ли мы уже вручную
+                    if (
+                        !this.vaultSocket ||
+                        this.vaultSocket.readyState === WebSocket.CLOSED
+                    ) {
+                        this.connectVaultSocket();
+                    }
+                }, 5000);
             };
 
             this.vaultSocket.onerror = (e) => {
-                console.error("CyberSync: Vault Socket Error", e);
+                console.error("CyberSync: 🌍 Vault Socket Error", e);
+                this.updateStatusBar("error");
             };
         } catch (e) {
             console.error("CyberSync: Failed to connect Vault Socket", e);
+            this.updateStatusBar("error");
         }
     }
 
@@ -401,29 +517,6 @@ export default class SyncPlugin extends Plugin {
             "User_" + Math.floor(Math.random() * 1000);
     }
 
-    updateStatusBar(status: string) {
-        this.statusBarItem.empty();
-        const icon = this.statusBarItem.createSpan({
-            cls: "cybersync-status-icon",
-        });
-        let text = "● CyberSync: Off";
-        let color = "var(--text-muted)";
-
-        if (status === "connected") {
-            text = "● CyberSync: OK";
-            color = "var(--text-success)";
-        } else if (status === "syncing") {
-            text = "↻ CyberSync: Sync";
-            color = "var(--text-warning)";
-        } else if (status === "error") {
-            text = "× CyberSync: Err";
-            color = "var(--text-error)";
-        }
-
-        icon.setText(text);
-        icon.style.color = color;
-    }
-
     async loadSettings() {
         this.settings = Object.assign(
             {},
@@ -452,7 +545,7 @@ export default class SyncPlugin extends Plugin {
         }
 
         this.isRequestingFullSync = false;
-        this.updateStatusBar("connecting");
+        this.updateStatusBar("syncing"); // Временный статус при подключении
 
         const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
         const url = `${baseUrl}/ws?file_id=${encodeURIComponent(fileId)}&client_id=${encodeURIComponent(this.activeClientId)}`;
@@ -462,7 +555,7 @@ export default class SyncPlugin extends Plugin {
 
             this.fileSocket.onopen = () => {
                 console.log(`CyberSync: File Connected ${fileId}`);
-                this.updateStatusBar("connected");
+                this.updateStatusBar(); // Обновляем на OK
                 const currentVer = this.getLocalVersion(fileId) || 0;
                 this.fileSocket?.send(
                     JSON.stringify({
@@ -473,7 +566,7 @@ export default class SyncPlugin extends Plugin {
             };
 
             this.fileSocket.onclose = () => {
-                this.updateStatusBar("disconnected");
+                this.updateStatusBar(); // Обновится на No File или Off
                 this.isRequestingFullSync = false;
             };
 
@@ -522,7 +615,7 @@ export default class SyncPlugin extends Plugin {
                     } catch (e) {
                         this.requestFullSync(file.path);
                     } finally {
-                        if (!data.is_history) this.updateStatusBar("connected");
+                        if (!data.is_history) this.updateStatusBar();
                     }
                 } else if (data.type === "ack") {
                     const ver = Number(data.version || 0);
@@ -613,7 +706,7 @@ export default class SyncPlugin extends Plugin {
                         }
                     } catch (e) {
                     } finally {
-                        this.updateStatusBar("connected");
+                        this.updateStatusBar();
                     }
                 } else if (data.type === "cursor") {
                     if (data.clientId === this.activeClientId) return;
@@ -650,7 +743,7 @@ export default class SyncPlugin extends Plugin {
         setTimeout(() => {
             if (this.isRequestingFullSync) {
                 this.isRequestingFullSync = false;
-                this.updateStatusBar("connected");
+                this.updateStatusBar();
             }
         }, 5000);
     }

@@ -99,7 +99,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "settings");
     __publicField(this, "fileSocket", null);
     __publicField(this, "vaultSocket", null);
-    // Очередь для сообщений Vault (если сокет не готов)
     __publicField(this, "vaultMessageQueue", []);
     __publicField(this, "activeClientId");
     __publicField(this, "color", "#" + Math.floor(Math.random() * 16777215).toString(16));
@@ -113,6 +112,17 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     await this.loadSettings();
     this.updateActiveClientId();
     this.statusBarItem = this.addStatusBarItem();
+    this.statusBarItem.addClass("cybersync-statusbar");
+    this.statusBarItem.style.cursor = "pointer";
+    this.statusBarItem.title = "Click to Reconnect";
+    this.statusBarItem.addEventListener("click", async () => {
+      await this.forceReconnect();
+    });
+    this.registerInterval(
+      window.setInterval(() => {
+        this.updateStatusBar();
+      }, 5e3)
+    );
     this.updateStatusBar("disconnected");
     this.addSettingTab(new CyberSyncSettingTab(this.app, this));
     this.connectVaultSocket();
@@ -168,13 +178,82 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     this.registerEditorExtension([cursorField, syncExtension]);
     this.app.workspace.on("file-open", (file) => {
       if (file) this.connectFileSocket(file.path);
-      else if (this.fileSocket) {
-        this.fileSocket.close();
+      else {
+        if (this.fileSocket) this.fileSocket.close();
         this.fileSocket = null;
+        this.updateStatusBar();
       }
     });
     const activeFile = this.app.workspace.getActiveFile();
     if (activeFile) this.connectFileSocket(activeFile.path);
+  }
+  // --- ЛОГИКА ПЕРЕПОДКЛЮЧЕНИЯ ---
+  async forceReconnect() {
+    new import_obsidian.Notice("CyberSync: Reconnecting...");
+    console.log("CyberSync: Force Reconnect requested by user.");
+    if (this.vaultSocket) {
+      this.vaultSocket.close();
+      this.vaultSocket = null;
+    }
+    if (this.fileSocket) {
+      this.fileSocket.close();
+      this.fileSocket = null;
+    }
+    this.updateStatusBar("disconnected");
+    setTimeout(() => {
+      this.connectVaultSocket();
+      const activeFile = this.app.workspace.getActiveFile();
+      if (activeFile) this.connectFileSocket(activeFile.path);
+    }, 500);
+  }
+  // --- ОБНОВЛЕННЫЙ СТАТУС БАР ---
+  // Теперь принимает необязательный аргумент.
+  // Если аргумент не передан, вычисляет статус на основе состояния сокетов.
+  updateStatusBar(forceStatus) {
+    var _a, _b;
+    this.statusBarItem.empty();
+    const icon = this.statusBarItem.createSpan({
+      cls: "cybersync-status-icon"
+    });
+    let text = "";
+    let color = "";
+    if (forceStatus) {
+      if (forceStatus === "connected") {
+        text = "\u25CF CyberSync: OK";
+        color = "var(--text-success)";
+      } else if (forceStatus === "syncing") {
+        text = "\u21BB CyberSync: Sync";
+        color = "var(--text-warning)";
+      } else if (forceStatus === "error") {
+        text = "\xD7 CyberSync: Err";
+        color = "var(--text-error)";
+      } else {
+        text = "\u25CF CyberSync: Off";
+        color = "var(--text-muted)";
+      }
+    } else {
+      const vaultReady = ((_a = this.vaultSocket) == null ? void 0 : _a.readyState) === WebSocket.OPEN;
+      const fileReady = ((_b = this.fileSocket) == null ? void 0 : _b.readyState) === WebSocket.OPEN;
+      const hasActiveFile = this.app.workspace.getActiveFile() !== null;
+      if (vaultReady && (fileReady || !hasActiveFile)) {
+        text = "\u25CF CyberSync: OK";
+        color = "var(--text-success)";
+      } else if (vaultReady && hasActiveFile && !fileReady) {
+        text = "\u25CF CyberSync: No File";
+        color = "var(--text-warning)";
+      } else if (!vaultReady && fileReady) {
+        text = "\u25CF CyberSync: No Vault";
+        color = "var(--text-warning)";
+      } else if (!vaultReady && !fileReady) {
+        text = "\xD7 CyberSync: Off";
+        color = "var(--text-muted)";
+      } else {
+        text = "\u25CF CyberSync: Check";
+        color = "var(--text-muted)";
+      }
+    }
+    icon.setText(text);
+    icon.style.color = color;
   }
   // --- VAULT EVENTS ---
   sendVaultMessage(msg) {
@@ -219,8 +298,8 @@ var SyncPlugin = class extends import_obsidian.Plugin {
   // --- VAULT SOCKET CONNECTION ---
   connectVaultSocket() {
     const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
-    const url = `${baseUrl}/ws?file_id=__global__&client_id=${encodeURIComponent(this.activeClientId)}`;
-    console.log("CyberSync: Connecting to Vault Socket...", url);
+    const url = `${baseUrl}/ws?file_id=__global__&client_id=${encodeURIComponent(this.activeClientId)}&t=${Date.now()}`;
+    console.log("CyberSync: \u{1F30D} Connecting to Vault Socket...", url);
     try {
       if (this.vaultSocket) {
         this.vaultSocket.close();
@@ -228,7 +307,8 @@ var SyncPlugin = class extends import_obsidian.Plugin {
       this.vaultSocket = new WebSocket(url);
       this.vaultSocket.onopen = () => {
         var _a;
-        console.log("CyberSync: \u2705 Connected to Global Vault!");
+        console.log("CyberSync: \u{1F30D}\u2705 Connected to Global Vault!");
+        this.updateStatusBar();
         while (this.vaultMessageQueue.length > 0) {
           const msg = this.vaultMessageQueue.shift();
           if (msg) (_a = this.vaultSocket) == null ? void 0 : _a.send(msg);
@@ -238,7 +318,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
         const data = JSON.parse(event.data);
         if (data.clientId === this.activeClientId) return;
         console.log(
-          "CyberSync: Received Vault Event:",
+          "CyberSync: \u{1F30D} Received Vault Event:",
           data.type,
           data.path
         );
@@ -300,15 +380,24 @@ var SyncPlugin = class extends import_obsidian.Plugin {
           this.isApplyingRemoteVaultAction = false;
         }
       };
-      this.vaultSocket.onclose = () => {
-        console.warn("CyberSync: Vault Socket closed. Retry in 5s...");
-        setTimeout(() => this.connectVaultSocket(), 5e3);
+      this.vaultSocket.onclose = (ev) => {
+        console.warn(
+          `CyberSync: \u{1F30D} Vault Socket closed. Retry in 5s...`
+        );
+        this.updateStatusBar();
+        setTimeout(() => {
+          if (!this.vaultSocket || this.vaultSocket.readyState === WebSocket.CLOSED) {
+            this.connectVaultSocket();
+          }
+        }, 5e3);
       };
       this.vaultSocket.onerror = (e) => {
-        console.error("CyberSync: Vault Socket Error", e);
+        console.error("CyberSync: \u{1F30D} Vault Socket Error", e);
+        this.updateStatusBar("error");
       };
     } catch (e) {
       console.error("CyberSync: Failed to connect Vault Socket", e);
+      this.updateStatusBar("error");
     }
   }
   async createFolderRecursively(path) {
@@ -334,26 +423,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     var _a;
     this.activeClientId = ((_a = this.settings.clientId) == null ? void 0 : _a.trim()) || "User_" + Math.floor(Math.random() * 1e3);
   }
-  updateStatusBar(status) {
-    this.statusBarItem.empty();
-    const icon = this.statusBarItem.createSpan({
-      cls: "cybersync-status-icon"
-    });
-    let text = "\u25CF CyberSync: Off";
-    let color = "var(--text-muted)";
-    if (status === "connected") {
-      text = "\u25CF CyberSync: OK";
-      color = "var(--text-success)";
-    } else if (status === "syncing") {
-      text = "\u21BB CyberSync: Sync";
-      color = "var(--text-warning)";
-    } else if (status === "error") {
-      text = "\xD7 CyberSync: Err";
-      color = "var(--text-error)";
-    }
-    icon.setText(text);
-    icon.style.color = color;
-  }
   async loadSettings() {
     this.settings = Object.assign(
       {},
@@ -377,7 +446,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
       this.fileSocket = null;
     }
     this.isRequestingFullSync = false;
-    this.updateStatusBar("connecting");
+    this.updateStatusBar("syncing");
     const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
     const url = `${baseUrl}/ws?file_id=${encodeURIComponent(fileId)}&client_id=${encodeURIComponent(this.activeClientId)}`;
     try {
@@ -385,7 +454,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
       this.fileSocket.onopen = () => {
         var _a;
         console.log(`CyberSync: File Connected ${fileId}`);
-        this.updateStatusBar("connected");
+        this.updateStatusBar();
         const currentVer = this.getLocalVersion(fileId) || 0;
         (_a = this.fileSocket) == null ? void 0 : _a.send(
           JSON.stringify({
@@ -395,7 +464,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
         );
       };
       this.fileSocket.onclose = () => {
-        this.updateStatusBar("disconnected");
+        this.updateStatusBar();
         this.isRequestingFullSync = false;
       };
       this.fileSocket.onerror = () => {
@@ -436,7 +505,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
           } catch (e) {
             this.requestFullSync(file.path);
           } finally {
-            if (!data.is_history) this.updateStatusBar("connected");
+            if (!data.is_history) this.updateStatusBar();
           }
         } else if (data.type === "ack") {
           const ver = Number(data.version || 0);
@@ -521,7 +590,7 @@ ${localContent}
             }
           } catch (e) {
           } finally {
-            this.updateStatusBar("connected");
+            this.updateStatusBar();
           }
         } else if (data.type === "cursor") {
           if (data.clientId === this.activeClientId) return;
@@ -555,7 +624,7 @@ ${localContent}
     setTimeout(() => {
       if (this.isRequestingFullSync) {
         this.isRequestingFullSync = false;
-        this.updateStatusBar("connected");
+        this.updateStatusBar();
       }
     }, 5e3);
   }

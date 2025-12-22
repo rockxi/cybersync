@@ -13,6 +13,7 @@ import {
     StateEffect,
     ChangeSet,
     Transaction,
+    Annotation,
 } from "@codemirror/state";
 import {
     EditorView,
@@ -36,7 +37,11 @@ const DEFAULT_SETTINGS: CyberSyncSettings = {
     fileVersions: {},
 };
 
-// --- ТИПЫ ДАННЫХ ---
+// --- АННОТАЦИЯ ДЛЯ ОТЛИЧИЯ УДАЛЕННЫХ ИЗМЕНЕНИЙ ---
+// Если транзакция помечена этим, значит она пришла с сервера
+const RemoteUpdate = Annotation.define<boolean>();
+
+// --- ТИПЫ ДАННЫХ ДЛЯ КУРСОРА ---
 interface CursorPosition {
     pos: number;
     clientId: string;
@@ -103,7 +108,6 @@ export default class SyncPlugin extends Plugin {
     color: string = "#" + Math.floor(Math.random() * 16777215).toString(16);
     statusBarItem: HTMLElement;
 
-    private isApplyingRemoteChange = false;
     private isRequestingFullSync = false;
 
     async onload() {
@@ -121,27 +125,42 @@ export default class SyncPlugin extends Plugin {
                 if (pluginInstance.socket?.readyState !== WebSocket.OPEN)
                     return;
 
-                if (
-                    update.docChanged &&
-                    !this.isApplyingRemoteChange &&
-                    update.transactions.some(
+                // --- ГЛАВНАЯ ЗАЩИТА ОТ ЦИКЛОВ ---
+                // Проверяем: есть ли в транзакции наша метка RemoteUpdate?
+                const isRemote = update.transactions.some((tr) =>
+                    tr.annotation(RemoteUpdate),
+                );
+                if (isRemote) {
+                    // Это изменение пришло из сокета (мы сами его применили).
+                    // НЕ ОТПРАВЛЯЕМ ЕГО ОБРАТНО!
+                    return;
+                }
+
+                if (update.docChanged) {
+                    // Дополнительная проверка на UserEvent для надежности,
+                    // но RemoteUpdate важнее.
+                    const isUserAction = update.transactions.some(
                         (tr) =>
                             tr.isUserEvent("input") ||
                             tr.isUserEvent("delete") ||
                             tr.isUserEvent("undo") ||
-                            tr.isUserEvent("redo"),
-                    )
-                ) {
-                    pluginInstance.socket.send(
-                        JSON.stringify({
-                            type: "text_change",
-                            changes: update.changes.toJSON(),
-                            clientId: pluginInstance.activeClientId,
-                        }),
+                            tr.isUserEvent("redo") ||
+                            // Разрешаем "unknown", если это не RemoteUpdate (иногда paste/drag так работают)
+                            !tr.annotation(RemoteUpdate),
                     );
+
+                    if (isUserAction) {
+                        pluginInstance.socket.send(
+                            JSON.stringify({
+                                type: "text_change",
+                                changes: update.changes.toJSON(),
+                                clientId: pluginInstance.activeClientId,
+                            }),
+                        );
+                    }
                 }
 
-                if (update.selectionSet && !this.isApplyingRemoteChange) {
+                if (update.selectionSet && !isRemote) {
                     const pos = update.state.selection.main.head;
                     pluginInstance.socket.send(
                         JSON.stringify({
@@ -180,40 +199,24 @@ export default class SyncPlugin extends Plugin {
             "User_" + Math.floor(Math.random() * 1000);
     }
 
-    updateStatusBar(
-        status:
-            | "connected"
-            | "disconnected"
-            | "connecting"
-            | "error"
-            | "syncing",
-    ) {
+    updateStatusBar(status: string) {
         this.statusBarItem.empty();
         const icon = this.statusBarItem.createSpan({
             cls: "cybersync-status-icon",
         });
 
-        switch (status) {
-            case "connected":
-                icon.setText("● CyberSync: OK");
-                icon.style.color = "var(--text-success)";
-                break;
-            case "connecting":
-                icon.setText("○ CyberSync: ...");
-                icon.style.color = "var(--text-accent)";
-                break;
-            case "syncing":
-                icon.setText("↻ CyberSync: Sync");
-                icon.style.color = "var(--text-warning)";
-                break;
-            case "error":
-                icon.setText("× CyberSync: Err");
-                icon.style.color = "var(--text-error)";
-                break;
-            case "disconnected":
-                icon.setText("● CyberSync: Off");
-                icon.style.color = "var(--text-muted)";
-                break;
+        if (status === "connected") {
+            icon.setText("● CyberSync: OK");
+            icon.style.color = "var(--text-success)";
+        } else if (status === "syncing") {
+            icon.setText("↻ CyberSync: Sync");
+            icon.style.color = "var(--text-warning)";
+        } else if (status === "error") {
+            icon.setText("× CyberSync: Err");
+            icon.style.color = "var(--text-error)";
+        } else {
+            icon.setText("● CyberSync: Off");
+            icon.style.color = "var(--text-muted)";
         }
     }
 
@@ -222,7 +225,7 @@ export default class SyncPlugin extends Plugin {
 
         if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
 
-        console.log("CyberSync: Requesting Full Sync (Conflict/Mismatch)...");
+        console.log("CyberSync: Requesting Full Sync...");
         this.isRequestingFullSync = true;
         this.updateStatusBar("syncing");
 
@@ -234,7 +237,7 @@ export default class SyncPlugin extends Plugin {
 
         setTimeout(() => {
             if (this.isRequestingFullSync) {
-                console.warn("CyberSync: Full sync timed out, resetting flag");
+                console.warn("CyberSync: Full sync timed out");
                 this.isRequestingFullSync = false;
                 this.updateStatusBar("connected");
             }
@@ -261,9 +264,8 @@ export default class SyncPlugin extends Plugin {
         }
 
         this.isRequestingFullSync = false;
-        this.isApplyingRemoteChange = false;
-
         this.updateStatusBar("connecting");
+
         const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
         const url = `${baseUrl}/ws/${encodeURIComponent(fileId)}/${encodeURIComponent(this.activeClientId)}`;
 
@@ -273,11 +275,7 @@ export default class SyncPlugin extends Plugin {
             this.socket.onopen = () => {
                 console.log(`CyberSync: Connected to ${fileId}`);
                 this.updateStatusBar("connected");
-
                 const currentVer = this.getLocalVersion(fileId) || 0;
-                console.log(
-                    `CyberSync: Sending handshake for ${fileId}, local version: ${currentVer}`,
-                );
 
                 this.socket?.send(
                     JSON.stringify({
@@ -302,7 +300,6 @@ export default class SyncPlugin extends Plugin {
                 const view =
                     this.app.workspace.getActiveViewOfType(MarkdownView);
                 if (!view) return;
-
                 const file = view.file;
                 if (!file) return;
                 const cm = (view.editor as any).cm as EditorView;
@@ -320,41 +317,35 @@ export default class SyncPlugin extends Plugin {
                     )
                         return;
 
-                    this.isApplyingRemoteChange = true;
                     if (data.is_history) this.updateStatusBar("syncing");
 
                     try {
                         const changes = ChangeSet.fromJSON(data.changes);
-
                         if (changes.length !== cm.state.doc.length) {
                             console.warn(
-                                `CyberSync: Mismatch on v${data.version}! Requesting Full Sync.`,
+                                `CyberSync: Mismatch v${data.version}. Req Full Sync.`,
                             );
                             this.requestFullSync(file.path);
                             return;
                         }
 
+                        // ВАЖНО: Добавляем аннотацию RemoteUpdate!
                         cm.dispatch({
                             changes: changes,
                             scrollIntoView: !data.is_history,
+                            annotations: [RemoteUpdate.of(true)],
                         });
 
-                        if (data.version) {
+                        if (data.version)
                             await this.updateLocalVersion(
                                 file.path,
                                 data.version,
                             );
-                        }
                     } catch (e) {
-                        console.error(
-                            `CyberSync: Failed to apply delta v${data.version}`,
-                            e,
-                        );
+                        console.error("Apply delta failed", e);
                         this.requestFullSync(file.path);
                     } finally {
-                        this.isApplyingRemoteChange = false;
-                        if (!data.is_history && !this.isRequestingFullSync)
-                            this.updateStatusBar("connected");
+                        if (!data.is_history) this.updateStatusBar("connected");
                     }
                 }
 
@@ -363,6 +354,7 @@ export default class SyncPlugin extends Plugin {
                     const ver = Number(data.version || 0);
                     if (ver) {
                         await this.updateLocalVersion(file.path, ver);
+                        // Отправляем хинт только если это была наша правка
                         const content = cm.state.doc.toString();
                         this.socket?.send(
                             JSON.stringify({
@@ -377,7 +369,6 @@ export default class SyncPlugin extends Plugin {
                 // --- FULL SYNC ---
                 else if (data.type === "full_sync") {
                     this.isRequestingFullSync = false;
-                    this.isApplyingRemoteChange = true;
 
                     try {
                         const serverContent = data.content || "";
@@ -398,6 +389,8 @@ ${serverContent}
 ${localContent}
 >>>>>>> LOCAL (My changes)
 `;
+                            // ВАЖНО: Аннотация RemoteUpdate!
+                            // Мы меняем текст, но это НЕ должно триггерить отправку на сервер
                             cm.dispatch({
                                 changes: {
                                     from: 0,
@@ -405,37 +398,34 @@ ${localContent}
                                     insert: conflictText,
                                 },
                                 scrollIntoView: false,
+                                annotations: [RemoteUpdate.of(true)],
                             });
 
                             await this.updateLocalVersion(file.path, serverVer);
                             new Notice(
-                                "CyberSync: Resync complete (with conflicts).",
+                                "CyberSync: Conflict merged. Resolve manually.",
                             );
                         }
                     } catch (e) {
-                        console.error(
-                            "CyberSync: Failed to apply full_sync",
-                            e,
-                        );
+                        console.error("Full sync failed", e);
                     } finally {
-                        this.isApplyingRemoteChange = false;
                         this.updateStatusBar("connected");
                     }
-                }
-
-                // --- CURSOR / DISCONNECT ---
-                else if (data.type === "cursor") {
+                } else if (data.type === "cursor") {
                     if (data.clientId === this.activeClientId) return;
+                    // Курсоры тоже метим, на всякий случай
                     cm.dispatch({
                         effects: updateCursorEffect.of({
                             pos: data.pos,
                             clientId: data.clientId,
                             color: data.color,
                         }),
+                        annotations: [RemoteUpdate.of(true)],
                     });
                 } else if (data.type === "disconnect") {
                     cm.dispatch({
                         effects: removeCursorEffect.of(data.clientId),
+                        annotations: [RemoteUpdate.of(true)],
                     });
                 }
             };

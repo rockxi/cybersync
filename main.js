@@ -32,6 +32,7 @@ var DEFAULT_SETTINGS = {
   clientId: "",
   fileVersions: {}
 };
+var RemoteUpdate = import_state.Annotation.define();
 var updateCursorEffect = import_state.StateEffect.define();
 var removeCursorEffect = import_state.StateEffect.define();
 var CursorWidget = class extends import_view.WidgetType {
@@ -87,7 +88,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "activeClientId");
     __publicField(this, "color", "#" + Math.floor(Math.random() * 16777215).toString(16));
     __publicField(this, "statusBarItem");
-    __publicField(this, "isApplyingRemoteChange", false);
     __publicField(this, "isRequestingFullSync", false);
   }
   async onload() {
@@ -102,18 +102,28 @@ var SyncPlugin = class extends import_obsidian.Plugin {
         var _a;
         if (((_a = pluginInstance.socket) == null ? void 0 : _a.readyState) !== WebSocket.OPEN)
           return;
-        if (update.docChanged && !this.isApplyingRemoteChange && update.transactions.some(
-          (tr) => tr.isUserEvent("input") || tr.isUserEvent("delete") || tr.isUserEvent("undo") || tr.isUserEvent("redo")
-        )) {
-          pluginInstance.socket.send(
-            JSON.stringify({
-              type: "text_change",
-              changes: update.changes.toJSON(),
-              clientId: pluginInstance.activeClientId
-            })
-          );
+        const isRemote = update.transactions.some(
+          (tr) => tr.annotation(RemoteUpdate)
+        );
+        if (isRemote) {
+          return;
         }
-        if (update.selectionSet && !this.isApplyingRemoteChange) {
+        if (update.docChanged) {
+          const isUserAction = update.transactions.some(
+            (tr) => tr.isUserEvent("input") || tr.isUserEvent("delete") || tr.isUserEvent("undo") || tr.isUserEvent("redo") || // Разрешаем "unknown", если это не RemoteUpdate (иногда paste/drag так работают)
+            !tr.annotation(RemoteUpdate)
+          );
+          if (isUserAction) {
+            pluginInstance.socket.send(
+              JSON.stringify({
+                type: "text_change",
+                changes: update.changes.toJSON(),
+                clientId: pluginInstance.activeClientId
+              })
+            );
+          }
+        }
+        if (update.selectionSet && !isRemote) {
           const pos = update.state.selection.main.head;
           pluginInstance.socket.send(
             JSON.stringify({
@@ -149,33 +159,24 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     const icon = this.statusBarItem.createSpan({
       cls: "cybersync-status-icon"
     });
-    switch (status) {
-      case "connected":
-        icon.setText("\u25CF CyberSync: OK");
-        icon.style.color = "var(--text-success)";
-        break;
-      case "connecting":
-        icon.setText("\u25CB CyberSync: ...");
-        icon.style.color = "var(--text-accent)";
-        break;
-      case "syncing":
-        icon.setText("\u21BB CyberSync: Sync");
-        icon.style.color = "var(--text-warning)";
-        break;
-      case "error":
-        icon.setText("\xD7 CyberSync: Err");
-        icon.style.color = "var(--text-error)";
-        break;
-      case "disconnected":
-        icon.setText("\u25CF CyberSync: Off");
-        icon.style.color = "var(--text-muted)";
-        break;
+    if (status === "connected") {
+      icon.setText("\u25CF CyberSync: OK");
+      icon.style.color = "var(--text-success)";
+    } else if (status === "syncing") {
+      icon.setText("\u21BB CyberSync: Sync");
+      icon.style.color = "var(--text-warning)";
+    } else if (status === "error") {
+      icon.setText("\xD7 CyberSync: Err");
+      icon.style.color = "var(--text-error)";
+    } else {
+      icon.setText("\u25CF CyberSync: Off");
+      icon.style.color = "var(--text-muted)";
     }
   }
   requestFullSync(fileId) {
     if (this.isRequestingFullSync) return;
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-    console.log("CyberSync: Requesting Full Sync (Conflict/Mismatch)...");
+    console.log("CyberSync: Requesting Full Sync...");
     this.isRequestingFullSync = true;
     this.updateStatusBar("syncing");
     this.socket.send(
@@ -185,7 +186,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     );
     setTimeout(() => {
       if (this.isRequestingFullSync) {
-        console.warn("CyberSync: Full sync timed out, resetting flag");
+        console.warn("CyberSync: Full sync timed out");
         this.isRequestingFullSync = false;
         this.updateStatusBar("connected");
       }
@@ -208,7 +209,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
       this.socket = null;
     }
     this.isRequestingFullSync = false;
-    this.isApplyingRemoteChange = false;
     this.updateStatusBar("connecting");
     const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
     const url = `${baseUrl}/ws/${encodeURIComponent(fileId)}/${encodeURIComponent(this.activeClientId)}`;
@@ -219,9 +219,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
         console.log(`CyberSync: Connected to ${fileId}`);
         this.updateStatusBar("connected");
         const currentVer = this.getLocalVersion(fileId) || 0;
-        console.log(
-          `CyberSync: Sending handshake for ${fileId}, local version: ${currentVer}`
-        );
         (_a = this.socket) == null ? void 0 : _a.send(
           JSON.stringify({
             type: "handshake",
@@ -251,37 +248,31 @@ var SyncPlugin = class extends import_obsidian.Plugin {
           if (data.version && data.version <= localVer) return;
           if (data.clientId === this.activeClientId && !data.is_history)
             return;
-          this.isApplyingRemoteChange = true;
           if (data.is_history) this.updateStatusBar("syncing");
           try {
             const changes = import_state.ChangeSet.fromJSON(data.changes);
             if (changes.length !== cm.state.doc.length) {
               console.warn(
-                `CyberSync: Mismatch on v${data.version}! Requesting Full Sync.`
+                `CyberSync: Mismatch v${data.version}. Req Full Sync.`
               );
               this.requestFullSync(file.path);
               return;
             }
             cm.dispatch({
               changes,
-              scrollIntoView: !data.is_history
+              scrollIntoView: !data.is_history,
+              annotations: [RemoteUpdate.of(true)]
             });
-            if (data.version) {
+            if (data.version)
               await this.updateLocalVersion(
                 file.path,
                 data.version
               );
-            }
           } catch (e) {
-            console.error(
-              `CyberSync: Failed to apply delta v${data.version}`,
-              e
-            );
+            console.error("Apply delta failed", e);
             this.requestFullSync(file.path);
           } finally {
-            this.isApplyingRemoteChange = false;
-            if (!data.is_history && !this.isRequestingFullSync)
-              this.updateStatusBar("connected");
+            if (!data.is_history) this.updateStatusBar("connected");
           }
         } else if (data.type === "ack") {
           const ver = Number(data.version || 0);
@@ -298,7 +289,6 @@ var SyncPlugin = class extends import_obsidian.Plugin {
           }
         } else if (data.type === "full_sync") {
           this.isRequestingFullSync = false;
-          this.isApplyingRemoteChange = true;
           try {
             const serverContent = data.content || "";
             const localContent = cm.state.doc.toString();
@@ -322,20 +312,17 @@ ${localContent}
                   to: localContent.length,
                   insert: conflictText
                 },
-                scrollIntoView: false
+                scrollIntoView: false,
+                annotations: [RemoteUpdate.of(true)]
               });
               await this.updateLocalVersion(file.path, serverVer);
               new import_obsidian.Notice(
-                "CyberSync: Resync complete (with conflicts)."
+                "CyberSync: Conflict merged. Resolve manually."
               );
             }
           } catch (e) {
-            console.error(
-              "CyberSync: Failed to apply full_sync",
-              e
-            );
+            console.error("Full sync failed", e);
           } finally {
-            this.isApplyingRemoteChange = false;
             this.updateStatusBar("connected");
           }
         } else if (data.type === "cursor") {
@@ -345,11 +332,13 @@ ${localContent}
               pos: data.pos,
               clientId: data.clientId,
               color: data.color
-            })
+            }),
+            annotations: [RemoteUpdate.of(true)]
           });
         } else if (data.type === "disconnect") {
           cm.dispatch({
-            effects: removeCursorEffect.of(data.clientId)
+            effects: removeCursorEffect.of(data.clientId),
+            annotations: [RemoteUpdate.of(true)]
           });
         }
       };

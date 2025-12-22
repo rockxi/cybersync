@@ -379,23 +379,38 @@ export default class SyncPlugin extends Plugin {
                         const localContent = cm.state.doc.toString();
                         const serverVer = Number(data.version || 0);
 
-                        console.log(
-                            `CyberSync: Applying Full Sync v${serverVer}`,
-                        );
+                        console.log(`CyberSync: Applying Full Sync v${serverVer}`);
 
+                        // Хелпер для удаления пустоты в конце (пробелы и переносы)
+                        const normalize = (str: string) => str.replace(/\s+$/, "");
+
+                        // 1. Полное совпадение
                         if (serverContent === localContent) {
+                             await this.updateLocalVersion(file.path, serverVer);
+                             console.log("CyberSync: Full sync matched exactly.");
+                        }
+                        // 2. Совпадение по смыслу (отличие только в переносах строк в конце)
+                        // В этом случае НЕ показываем конфликт, а просто молча накатываем версию сервера
+                        else if (normalize(serverContent) === normalize(localContent)) {
+                            console.log("CyberSync: Trailing newline mismatch. Auto-fixing.");
+                            cm.dispatch({
+                                changes: {
+                                    from: 0,
+                                    to: localContent.length,
+                                    insert: serverContent,
+                                },
+                                scrollIntoView: false,
+                                annotations: [RemoteUpdate.of(true)]
+                            });
                             await this.updateLocalVersion(file.path, serverVer);
-                            console.log("CyberSync: Full sync matched.");
-                        } else {
-                            const serverHasMarkers =
-                                this.hasConflictMarkers(serverContent);
-                            const localHasMarkers =
-                                this.hasConflictMarkers(localContent);
+                        }
+                        // 3. Реальный конфликт
+                        else {
+                            const serverHasMarkers = this.hasConflictMarkers(serverContent);
+                            const localHasMarkers = this.hasConflictMarkers(localContent);
 
                             if (!serverHasMarkers && localHasMarkers) {
-                                console.log(
-                                    "CyberSync: Detected resolution from server. Overwriting local conflicts.",
-                                );
+                                console.log("CyberSync: Detected resolution from server. Overwriting local conflicts.");
                                 cm.dispatch({
                                     changes: {
                                         from: 0,
@@ -403,17 +418,14 @@ export default class SyncPlugin extends Plugin {
                                         insert: serverContent,
                                     },
                                     scrollIntoView: false,
-                                    annotations: [RemoteUpdate.of(true)],
+                                    annotations: [RemoteUpdate.of(true)]
                                 });
-                                await this.updateLocalVersion(
-                                    file.path,
-                                    serverVer,
-                                );
-                                new Notice(
-                                    "CyberSync: Conflict resolved remotely.",
-                                );
-                            } else {
-                                const conflictText = `<<<<<<< REMOTE (Server v${serverVer})
+                                await this.updateLocalVersion(file.path, serverVer);
+                                new Notice("CyberSync: Conflict resolved remotely.");
+                            }
+                            else {
+                                const conflictText =
+`<<<<<<< REMOTE (Server v${serverVer})
 ${serverContent}
 =======
 ${localContent}
@@ -426,16 +438,11 @@ ${localContent}
                                         insert: conflictText,
                                     },
                                     scrollIntoView: false,
-                                    annotations: [RemoteUpdate.of(true)],
+                                    annotations: [RemoteUpdate.of(true)]
                                 });
 
-                                await this.updateLocalVersion(
-                                    file.path,
-                                    serverVer,
-                                );
-                                new Notice(
-                                    "CyberSync: Conflict detected. Resolve manually.",
-                                );
+                                await this.updateLocalVersion(file.path, serverVer);
+                                new Notice("CyberSync: Conflict detected. Resolve manually.");
                             }
                         }
                     } catch (e) {
@@ -443,6 +450,7 @@ ${localContent}
                     } finally {
                         this.updateStatusBar("connected");
                     }
+                }
                 } else if (data.type === "cursor") {
                     if (data.clientId === this.activeClientId) return;
                     cm.dispatch({

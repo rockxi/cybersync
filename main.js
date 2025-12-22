@@ -87,9 +87,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "activeClientId");
     __publicField(this, "color", "#" + Math.floor(Math.random() * 16777215).toString(16));
     __publicField(this, "statusBarItem");
-    // Флаг: мы применяем изменения программно (не отправлять их обратно)
     __publicField(this, "isApplyingRemoteChange", false);
-    // Флаг: мы уже запросили Full Sync и ждем ответа (игнорируем ошибки дельт)
     __publicField(this, "isRequestingFullSync", false);
   }
   async onload() {
@@ -177,7 +175,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
   requestFullSync(fileId) {
     if (this.isRequestingFullSync) return;
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-    console.log("CyberSync: Requesting Full Sync (Conflict Resolution)...");
+    console.log("CyberSync: Requesting Full Sync (Conflict/Mismatch)...");
     this.isRequestingFullSync = true;
     this.updateStatusBar("syncing");
     this.socket.send(
@@ -250,9 +248,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
         if (data.type === "text_change") {
           if (this.isRequestingFullSync) return;
           const localVer = this.getLocalVersion(file.path);
-          if (data.version && data.version <= localVer) {
-            return;
-          }
+          if (data.version && data.version <= localVer) return;
           if (data.clientId === this.activeClientId && !data.is_history)
             return;
           this.isApplyingRemoteChange = true;
@@ -261,7 +257,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
             const changes = import_state.ChangeSet.fromJSON(data.changes);
             if (changes.length !== cm.state.doc.length) {
               console.warn(
-                `CyberSync: Mismatch! Remote len ${changes.length} != Local ${cm.state.doc.length}.`
+                `CyberSync: Mismatch on v${data.version}! Requesting Full Sync.`
               );
               this.requestFullSync(file.path);
               return;
@@ -277,11 +273,14 @@ var SyncPlugin = class extends import_obsidian.Plugin {
               );
             }
           } catch (e) {
-            console.error("CyberSync: Failed to apply delta", e);
+            console.error(
+              `CyberSync: Failed to apply delta v${data.version}`,
+              e
+            );
             this.requestFullSync(file.path);
           } finally {
             this.isApplyingRemoteChange = false;
-            if (data.is_history && !this.isRequestingFullSync)
+            if (!data.is_history && !this.isRequestingFullSync)
               this.updateStatusBar("connected");
           }
         } else if (data.type === "ack") {
@@ -304,6 +303,9 @@ var SyncPlugin = class extends import_obsidian.Plugin {
             const serverContent = data.content || "";
             const localContent = cm.state.doc.toString();
             const serverVer = Number(data.version || 0);
+            console.log(
+              `CyberSync: Applying Full Sync v${serverVer}`
+            );
             if (serverContent === localContent) {
               await this.updateLocalVersion(file.path, serverVer);
               console.log("CyberSync: Full sync matched.");
@@ -323,7 +325,9 @@ ${localContent}
                 scrollIntoView: false
               });
               await this.updateLocalVersion(file.path, serverVer);
-              new import_obsidian.Notice("CyberSync: Conflict merged.");
+              new import_obsidian.Notice(
+                "CyberSync: Resync complete (with conflicts)."
+              );
             }
           } catch (e) {
             console.error(

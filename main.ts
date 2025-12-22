@@ -1,5 +1,17 @@
-import { App, Plugin, PluginSettingTab, Setting, MarkdownView } from "obsidian";
-import { Extension, StateField, StateEffect } from "@codemirror/state";
+import {
+    App,
+    Plugin,
+    PluginSettingTab,
+    Setting,
+    MarkdownView,
+    TFile,
+} from "obsidian";
+import {
+    Extension,
+    StateField,
+    StateEffect,
+    ChangeSet,
+} from "@codemirror/state";
 import {
     EditorView,
     Decoration,
@@ -12,12 +24,12 @@ import {
 // --- НАСТРОЙКИ ---
 interface CyberSyncSettings {
     serverUrl: string;
-    clientId: string; // Новое поле
+    clientId: string;
 }
 
 const DEFAULT_SETTINGS: CyberSyncSettings = {
     serverUrl: "ws://localhost:8000",
-    clientId: "", // По умолчанию пусто, будет генерироваться случайно
+    clientId: "",
 };
 
 // --- ТИПЫ ДАННЫХ ---
@@ -27,11 +39,9 @@ interface CursorPosition {
     color: string;
 }
 
-// --- ЭФФЕКТЫ ---
 const updateCursorEffect = StateEffect.define<CursorPosition>();
 const removeCursorEffect = StateEffect.define<string>();
 
-// --- ВИДЖЕТ ---
 class CursorWidget extends WidgetType {
     constructor(
         readonly color: string,
@@ -52,7 +62,6 @@ class CursorWidget extends WidgetType {
     }
 }
 
-// --- STATE FIELD ---
 const cursorField = StateField.define<DecorationSet>({
     create() {
         return Decoration.none;
@@ -66,19 +75,15 @@ const cursorField = StateField.define<DecorationSet>({
                     side: 0,
                 }).range(e.value.pos);
                 cursors = cursors.update({
-                    filter: (from, to, value) => {
-                        // @ts-ignore
-                        return value.widget.label !== e.value.clientId;
-                    },
+                    filter: (from, to, value) =>
+                        (value.widget as any).label !== e.value.clientId,
                     add: [deco],
                 });
             }
             if (e.is(removeCursorEffect)) {
                 cursors = cursors.update({
-                    filter: (from, to, value) => {
-                        // @ts-ignore
-                        return value.widget.label !== e.value;
-                    },
+                    filter: (from, to, value) =>
+                        (value.widget as any).label !== e.value,
                 });
             }
         }
@@ -87,60 +92,95 @@ const cursorField = StateField.define<DecorationSet>({
     provide: (f) => EditorView.decorations.from(f),
 });
 
-// --- ГЛАВНЫЙ КЛАСС ПЛАГИНА ---
 export default class SyncPlugin extends Plugin {
     settings: CyberSyncSettings;
     socket: WebSocket | null = null;
-    activeClientId: string; // ID, который используется в текущей сессии
+    activeClientId: string;
     color: string = "#" + Math.floor(Math.random() * 16777215).toString(16);
+    statusBarItem: HTMLElement;
+    private isApplyingRemoteChange = false;
 
     async onload() {
         await this.loadSettings();
-
-        // Устанавливаем ID: из настроек или генерируем новый
         this.updateActiveClientId();
+
+        // Создаем элемент в статус-баре
+        this.statusBarItem = this.addStatusBarItem();
+        this.updateStatusBar("disconnected");
 
         this.addSettingTab(new CyberSyncSettingTab(this.app, this));
 
         const pluginInstance = this;
-        const socketListener = ViewPlugin.fromClass(
-            class {
-                constructor(public view: EditorView) {}
-                update(update: ViewUpdate) {
-                    if (
-                        update.selectionSet &&
-                        pluginInstance.socket?.readyState === WebSocket.OPEN
-                    ) {
-                        const pos = update.state.selection.main.head;
-                        pluginInstance.socket.send(
-                            JSON.stringify({
-                                type: "cursor",
-                                pos: pos,
-                                color: pluginInstance.color,
-                            }),
-                        );
-                    }
+        const syncExtension = EditorView.updateListener.of(
+            (update: ViewUpdate) => {
+                if (pluginInstance.socket?.readyState !== WebSocket.OPEN)
+                    return;
+
+                if (update.docChanged && !this.isApplyingRemoteChange) {
+                    pluginInstance.socket.send(
+                        JSON.stringify({
+                            type: "text_change",
+                            changes: update.changes.toJSON(),
+                            clientId: pluginInstance.activeClientId,
+                        }),
+                    );
+                }
+
+                if (update.selectionSet) {
+                    const pos = update.state.selection.main.head;
+                    pluginInstance.socket.send(
+                        JSON.stringify({
+                            type: "cursor",
+                            pos: pos,
+                            color: pluginInstance.color,
+                            clientId: pluginInstance.activeClientId,
+                        }),
+                    );
                 }
             },
         );
 
-        this.registerEditorExtension([cursorField, socketListener]);
+        this.registerEditorExtension([cursorField, syncExtension]);
 
         this.app.workspace.on("file-open", (file) => {
             if (file) this.connectSocket(file.path);
         });
 
         const activeFile = this.app.workspace.getActiveFile();
-        if (activeFile) {
-            this.connectSocket(activeFile.path);
-        }
+        if (activeFile) this.connectSocket(activeFile.path);
     }
 
     updateActiveClientId() {
-        if (this.settings.clientId && this.settings.clientId.trim() !== "") {
-            this.activeClientId = this.settings.clientId.trim();
-        } else {
-            this.activeClientId = "User_" + Math.floor(Math.random() * 1000);
+        this.activeClientId =
+            this.settings.clientId?.trim() ||
+            "User_" + Math.floor(Math.random() * 1000);
+    }
+
+    updateStatusBar(
+        status: "connected" | "disconnected" | "connecting" | "error",
+    ) {
+        this.statusBarItem.empty();
+        const icon = this.statusBarItem.createSpan({
+            cls: "cybersync-status-icon",
+        });
+
+        switch (status) {
+            case "connected":
+                icon.setText("● CyberSync: OK");
+                icon.style.color = "var(--text-success)";
+                break;
+            case "connecting":
+                icon.setText("○ CyberSync: ...");
+                icon.style.color = "var(--text-accent)";
+                break;
+            case "error":
+                icon.setText("× CyberSync: Err");
+                icon.style.color = "var(--text-error)";
+                break;
+            case "disconnected":
+                icon.setText("● CyberSync: Off");
+                icon.style.color = "var(--text-muted)";
+                break;
         }
     }
 
@@ -154,43 +194,57 @@ export default class SyncPlugin extends Plugin {
 
     async saveSettings() {
         await this.saveData(this.settings);
-        this.updateActiveClientId(); // Обновляем рабочий ID
-
+        this.updateActiveClientId();
         const activeFile = this.app.workspace.getActiveFile();
-        if (activeFile) {
-            this.connectSocket(activeFile.path);
-        }
+        if (activeFile) this.connectSocket(activeFile.path);
     }
 
     connectSocket(fileId: string) {
         if (this.socket) {
             this.socket.close();
-            this.socket = null;
         }
 
+        this.updateStatusBar("connecting");
         const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
-        const encodedId = encodeURIComponent(fileId);
-        // Используем activeClientId
-        const url = `${baseUrl}/ws/${encodedId}/${encodeURIComponent(this.activeClientId)}`;
-
-        console.log("Connecting to:", url, "as", this.activeClientId);
+        const url = `${baseUrl}/ws/${encodeURIComponent(fileId)}/${encodeURIComponent(this.activeClientId)}`;
 
         try {
             this.socket = new WebSocket(url);
 
-            this.socket.onopen = () => console.log("CyberSync connected");
+            this.socket.onopen = () => {
+                console.log("CyberSync connected");
+                this.updateStatusBar("connected");
+            };
+
+            this.socket.onclose = () => {
+                this.updateStatusBar("disconnected");
+            };
+
+            this.socket.onerror = () => {
+                this.updateStatusBar("error");
+            };
 
             this.socket.onmessage = (event) => {
                 const data = JSON.parse(event.data);
                 const view =
                     this.app.workspace.getActiveViewOfType(MarkdownView);
-                if (!view) return;
+                if (!view || data.clientId === this.activeClientId) return;
 
-                // Фильтр своего эха
-                if (data.clientId === this.activeClientId) return;
+                const cm = (view.editor as any).cm as EditorView;
 
-                if (data.type === "cursor") {
-                    view.editor.cm.dispatch({
+                if (data.type === "text_change") {
+                    this.isApplyingRemoteChange = true;
+                    try {
+                        cm.dispatch({
+                            changes: ChangeSet.fromJSON(data.changes),
+                        });
+                    } catch (e) {
+                        console.error("Failed to apply remote change", e);
+                    } finally {
+                        this.isApplyingRemoteChange = false;
+                    }
+                } else if (data.type === "cursor") {
+                    cm.dispatch({
                         effects: updateCursorEffect.of({
                             pos: data.pos,
                             clientId: data.clientId,
@@ -198,13 +252,13 @@ export default class SyncPlugin extends Plugin {
                         }),
                     });
                 } else if (data.type === "disconnect") {
-                    view.editor.cm.dispatch({
+                    cm.dispatch({
                         effects: removeCursorEffect.of(data.clientId),
                     });
                 }
             };
         } catch (e) {
-            console.error("Connection error:", e);
+            this.updateStatusBar("error");
         }
     }
 
@@ -213,45 +267,32 @@ export default class SyncPlugin extends Plugin {
     }
 }
 
-// --- UI НАСТРОЕК ---
 class CyberSyncSettingTab extends PluginSettingTab {
     plugin: SyncPlugin;
-
     constructor(app: App, plugin: SyncPlugin) {
         super(app, plugin);
         this.plugin = plugin;
     }
-
     display(): void {
         const { containerEl } = this;
         containerEl.empty();
-
         containerEl.createEl("h2", { text: "CyberSync Settings" });
-
-        new Setting(containerEl)
-            .setName("Server URL")
-            .setDesc("WebSocket server address")
-            .addText((text) =>
-                text
-                    .setPlaceholder("ws://localhost:8000")
-                    .setValue(this.plugin.settings.serverUrl)
-                    .onChange(async (value) => {
-                        this.plugin.settings.serverUrl = value;
-                        await this.plugin.saveSettings();
-                    }),
-            );
-
+        new Setting(containerEl).setName("Server URL").addText((text) =>
+            text
+                .setValue(this.plugin.settings.serverUrl)
+                .onChange(async (v) => {
+                    this.plugin.settings.serverUrl = v;
+                    await this.plugin.saveSettings();
+                }),
+        );
         new Setting(containerEl)
             .setName("Client ID")
-            .setDesc(
-                "Your nickname shown to others. Leave empty for random ID.",
-            )
+            .setDesc("Nickname for sync")
             .addText((text) =>
                 text
-                    .setPlaceholder("Enter your name")
                     .setValue(this.plugin.settings.clientId)
-                    .onChange(async (value) => {
-                        this.plugin.settings.clientId = value;
+                    .onChange(async (v) => {
+                        this.plugin.settings.clientId = v;
                         await this.plugin.saveSettings();
                     }),
             );

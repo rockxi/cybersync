@@ -317,3 +317,217 @@ export default class SyncPlugin extends Plugin {
                     }
                     else if (data.type === "file_created") {
                         if (!this.app.vault.getAbstractFileByPath(data.path)) {
+                            await this.createFolderRecursively(data.path);
+                            await this.app.vault.create(data.path, "");
+                            console.log("CyberSync: Remote Created ->", data.path);
+                        }
+                    }
+                    else if (data.type === "file_deleted") {
+                        const file = this.app.vault.getAbstractFileByPath(data.path);
+                        if (file) {
+                            await this.app.vault.delete(file);
+                            console.log("CyberSync: Remote Deleted ->", data.path);
+                        }
+                    }
+                    else if (data.type === "file_renamed") {
+                        const file = this.app.vault.getAbstractFileByPath(data.oldPath);
+                        if (file) {
+                            await this.createFolderRecursively(data.path);
+                            await this.app.vault.rename(file, data.path);
+                            console.log("CyberSync: Remote Renamed ->", data.oldPath, "to", data.path);
+                        }
+                    }
+                } catch (e) {
+                    console.error("CyberSync: Error applying vault action:", e);
+                } finally {
+                    this.isApplyingRemoteVaultAction = false;
+                }
+            };
+
+            this.vaultSocket.onclose = () => {
+                console.log("CyberSync: 🌍 Vault Socket Closed");
+                this.updateStatusBar("disconnected");
+            };
+
+            this.vaultSocket.onerror = (e) => {
+                console.error("CyberSync: 🌍 Vault Socket Error", e);
+                this.updateStatusBar("error");
+            };
+
+        } catch (e) {
+            console.error("CyberSync: Vault Connect Failed", e);
+            this.updateStatusBar("error");
+        }
+    }
+
+    async createFolderRecursively(path: string) {
+        const folders = path.split("/").slice(0, -1);
+        if (folders.length === 0) return;
+
+        let current = "";
+        for (const folder of folders) {
+            current = current === "" ? folder : current + "/" + folder;
+            if (!this.app.vault.getAbstractFileByPath(current)) {
+                await this.app.vault.createFolder(current);
+            }
+        }
+    }
+
+    connectFileSocket(filepath: string) {
+         if (this.fileSocket) {
+             this.fileSocket.close();
+             this.fileSocket = null;
+         }
+
+         const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
+         const url = `${baseUrl}/ws?file_id=${encodeURIComponent(filepath)}&client_id=${encodeURIComponent(this.activeClientId)}`;
+
+         try {
+             this.fileSocket = new WebSocket(url);
+
+             this.fileSocket.onopen = () => {
+                 console.log("CyberSync: File Connected:", filepath);
+                 this.updateStatusBar("connected");
+
+                 const ver = this.settings.fileVersions[filepath] || 0;
+                 this.fileSocket.send(JSON.stringify({
+                     type: "handshake",
+                     version: ver
+                 }));
+             };
+
+             this.fileSocket.onmessage = async (event) => {
+                 const msg = JSON.parse(event.data);
+                 if (msg.clientId === this.activeClientId && msg.type !== "ack") return;
+
+                 if (msg.type === "text_change") {
+                     const file = this.app.workspace.getActiveFile();
+                     if (!file || file.path !== filepath) return;
+
+                     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+                     if (!view) return;
+
+                     // @ts-ignore
+                     const cm = view.editor.cm as EditorView;
+                     if (cm) {
+                         try {
+                             const changeSet = ChangeSet.fromJSON(msg.changes);
+                             cm.dispatch({
+                                 changes: changeSet,
+                                 annotations: [RemoteUpdate.of(true)]
+                             });
+
+                             this.settings.fileVersions[filepath] = msg.version;
+                             await this.saveSettings();
+                         } catch (e) {
+                             console.error("CyberSync: Failed to apply patches", e);
+                         }
+                     }
+                 }
+                 else if (msg.type === "ack") {
+                     this.settings.fileVersions[filepath] = msg.version;
+                     await this.saveSettings();
+                 }
+                 else if (msg.type === "full_sync") {
+                     const file = this.app.workspace.getActiveFile();
+                     if (file && file.path === filepath) {
+                         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+                         if (view) {
+                             view.editor.setValue(msg.content);
+                             this.settings.fileVersions[filepath] = msg.version;
+                             await this.saveSettings();
+                         }
+                     }
+                 }
+                 else if (msg.type === "cursor") {
+                     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+                     // @ts-ignore
+                     const cm = view?.editor?.cm as EditorView;
+                     if (cm) {
+                         cm.dispatch({
+                             effects: updateCursorEffect.of({
+                                 pos: msg.pos,
+                                 clientId: msg.clientId,
+                                 color: msg.color
+                             })
+                         });
+                     }
+                 }
+                 else if (msg.type === "disconnect") {
+                      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+                      // @ts-ignore
+                      const cm = view?.editor?.cm as EditorView;
+                      if (cm) {
+                          cm.dispatch({
+                              effects: removeCursorEffect.of(msg.clientId)
+                          });
+                      }
+                 }
+             };
+
+             this.fileSocket.onclose = () => {
+                 this.updateStatusBar();
+             };
+
+         } catch (e) {
+             console.error("CyberSync: File Connect Error", e);
+         }
+    }
+
+    updateActiveClientId() {
+        if (!this.settings.clientId) {
+            this.settings.clientId = "client-" + Math.random().toString(36).substr(2, 9);
+            this.saveSettings();
+        }
+        this.activeClientId = this.settings.clientId;
+    }
+
+    async loadSettings() {
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    }
+
+    async saveSettings() {
+        await this.saveData(this.settings);
+    }
+}
+
+class CyberSyncSettingTab extends PluginSettingTab {
+    plugin: SyncPlugin;
+
+    constructor(app: App, plugin: SyncPlugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
+
+    display(): void {
+        const { containerEl } = this;
+        containerEl.empty();
+
+        containerEl.createEl("h2", { text: "CyberSync Settings" });
+
+        new Setting(containerEl)
+            .setName("Server URL")
+            .setDesc("Address of the python server")
+            .addText(text => text
+                .setPlaceholder("ws://localhost:8000")
+                .setValue(this.plugin.settings.serverUrl)
+                .onChange(async (value) => {
+                    this.plugin.settings.serverUrl = value;
+                    await this.plugin.saveSettings();
+                    this.plugin.forceReconnect();
+                }));
+
+        new Setting(containerEl)
+            .setName("Client ID")
+            .setDesc("Unique ID for this device")
+            .addText(text => text
+                .setPlaceholder("client-123")
+                .setValue(this.plugin.settings.clientId)
+                .onChange(async (value) => {
+                    this.plugin.settings.clientId = value;
+                    await this.plugin.saveSettings();
+                    this.plugin.updateActiveClientId();
+                    this.plugin.forceReconnect();
+                }));
+    }
+}

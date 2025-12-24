@@ -1,696 +1,686 @@
 import {
-    App,
-    Plugin,
-    PluginSettingTab,
-    Setting,
-    MarkdownView,
-    TFile,
-    Notice,
-    TAbstractFile
+  App,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+  MarkdownView,
+  TFile,
+  Notice,
+  TAbstractFile,
 } from "obsidian";
 import {
-    Extension,
-    StateField,
-    StateEffect,
-    ChangeSet,
-    Transaction,
-    Annotation
+  Extension,
+  StateField,
+  StateEffect,
+  ChangeSet,
+  Transaction,
+  Annotation,
+  EditorState,
 } from "@codemirror/state";
 import {
-    EditorView,
-    Decoration,
-    DecorationSet,
-    ViewPlugin,
-    ViewUpdate,
-    WidgetType,
+  EditorView,
+  Decoration,
+  DecorationSet,
+  ViewPlugin,
+  ViewUpdate,
+  WidgetType,
 } from "@codemirror/view";
 
 // --- НАСТРОЙКИ ---
 interface CyberSyncSettings {
-    serverUrl: string;
-    clientId: string;
-    fileVersions: Record<string, number>;
-    lastSyncedHash: Record<string, string>; // Хеш последнего синхронизированного состояния
+  serverUrl: string;
+  clientId: string;
+  fileVersions: Record<string, number>;
+  lastSyncedHash: Record<string, string>;
+  offlineChanges: Record<string, boolean>; // Делали ли изменения оффлайн
 }
 
 const DEFAULT_SETTINGS: CyberSyncSettings = {
-    serverUrl: "ws://localhost:8000",
-    clientId: "",
-    fileVersions: {},
-    lastSyncedHash: {},
+  serverUrl: "ws://localhost:8000",
+  clientId: "",
+  fileVersions: {},
+  lastSyncedHash: {},
+  offlineChanges: {},
 };
 
 const RemoteUpdate = Annotation.define<boolean>();
 
 // --- КУРСОРЫ ---
 interface CursorPosition {
-    pos: number;
-    clientId: string;
-    color: string;
+  pos: number;
+  clientId: string;
+  color: string;
+  filePath: string;
 }
 
 const updateCursorEffect = StateEffect.define<CursorPosition>();
 const removeCursorEffect = StateEffect.define<string>();
 
 class CursorWidget extends WidgetType {
-    constructor(
-        readonly color: string,
-        readonly label: string,
-    ) {
-        super();
-    }
-    toDOM() {
-        const wrap = document.createElement("span");
-        wrap.className = "remote-cursor";
-        wrap.style.borderLeftColor = this.color;
-        const label = document.createElement("span");
-        label.className = "remote-cursor-label";
-        label.textContent = this.label;
-        label.style.backgroundColor = this.color;
-        wrap.appendChild(label);
-        return wrap;
-    }
+  constructor(
+    readonly color: string,
+    readonly label: string,
+  ) {
+    super();
+  }
+  toDOM() {
+    const wrap = document.createElement("span");
+    wrap.className = "remote-cursor";
+    wrap.style.borderLeftColor = this.color;
+    const label = document.createElement("span");
+    label.className = "remote-cursor-label";
+    label.textContent = this.label;
+    label.style.backgroundColor = this.color;
+    wrap.appendChild(label);
+    return wrap;
+  }
 }
 
 const cursorField = StateField.define<DecorationSet>({
-    create() {
+  create() {
+    return Decoration.none;
+  },
+  update(cursors, tr) {
+    try {
+      try {
+        cursors = cursors.map(tr.changes);
+      } catch (e) {
         return Decoration.none;
-    },
-    update(cursors, tr) {
-        try {
-            try { cursors = cursors.map(tr.changes); } catch (e) { return Decoration.none; }
+      }
 
-            for (let e of tr.effects) {
-                if (e.is(updateCursorEffect)) {
-                    if (e.value.pos < 0 || e.value.pos > tr.newDoc.length) continue;
-                    const deco = Decoration.widget({
-                        widget: new CursorWidget(e.value.color, e.value.clientId),
-                        side: 0,
-                    }).range(e.value.pos);
-                    cursors = cursors.update({
-                        filter: (from, to, value) => (value.widget as any).label !== e.value.clientId,
-                        add: [deco],
-                    });
-                }
-                if (e.is(removeCursorEffect)) {
-                    cursors = cursors.update({ filter: (from, to, value) => (value.widget as any).label !== e.value });
-                }
-            }
-            return cursors;
-        } catch (e) { return Decoration.none; }
-    },
-    provide: (f) => EditorView.decorations.from(f),
+      for (let e of tr.effects) {
+        if (e.is(updateCursorEffect)) {
+          if (e.value.pos < 0 || e.value.pos > tr.newDoc.length) continue;
+          const deco = Decoration.widget({
+            widget: new CursorWidget(e.value.color, e.value.clientId),
+            side: 0,
+          }).range(e.value.pos);
+          cursors = cursors.update({
+            filter: (from, to, value) =>
+              (value.widget as any).label !== e.value.clientId,
+            add: [deco],
+          });
+        }
+        if (e.is(removeCursorEffect)) {
+          cursors = cursors.update({
+            filter: (from, to, value) =>
+              (value.widget as any).label !== e.value,
+          });
+        }
+      }
+      return cursors;
+    } catch (e) {
+      return Decoration.none;
+    }
+  },
+  provide: (f) => EditorView.decorations.from(f),
 });
 
 export default class SyncPlugin extends Plugin {
-    settings: CyberSyncSettings;
+  settings: CyberSyncSettings;
+  globalSocket: WebSocket | null = null;
+  private reconnectTimeout: number | null = null;
 
-    fileSocket: WebSocket | null = null;
-    vaultSocket: WebSocket | null = null;
+  activeClientId: string;
+  color: string = "#" + Math.floor(Math.random() * 16777215).toString(16);
+  statusBarItem: HTMLElement;
 
-    private vaultMessageQueue: string[] = [];
-    private vaultReconnectTimeout: number | null = null;
-    private fileReconnectTimeout: number | null = null;
-    private currentFilePath: string | null = null;
+  private isOnline = false;
+  private isApplyingRemoteAction = false;
+  private pendingLocalChanges: Map<string, { changes: any; hash: string }> =
+    new Map();
 
-    activeClientId: string;
-    color: string = "#" + Math.floor(Math.random() * 16777215).toString(16);
-    statusBarItem: HTMLElement;
-
-    private isRequestingFullSync = false;
-    private lastLocalChangeTime = 0;
-
-    private isApplyingRemoteVaultAction = false;
-
-    // Простая функция хеширования
-    private hashString(str: string): string {
-        let hash = 0;
-        for (let i = 0; i < str.length; i++) {
-            const char = str.charCodeAt(i);
-            hash = ((hash << 5) - hash) + char;
-            hash = hash & hash;
-        }
-        return hash.toString(36);
+  private hashString(str: string): string {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = (hash << 5) - hash + char;
+      hash = hash & hash;
     }
+    return hash.toString(36);
+  }
 
-    async onload() {
-        console.log("CyberSync: Plugin Loading...");
-        await this.loadSettings();
-        this.updateActiveClientId();
+  async onload() {
+    console.log("CyberSync: Plugin Loading...");
+    await this.loadSettings();
+    this.updateActiveClientId();
 
-        this.statusBarItem = this.addStatusBarItem();
-        this.statusBarItem.addClass("cybersync-statusbar");
-        this.statusBarItem.style.cursor = "pointer";
-        this.statusBarItem.title = "Click to Reconnect";
+    this.statusBarItem = this.addStatusBarItem();
+    this.statusBarItem.addClass("cybersync-statusbar");
+    this.statusBarItem.style.cursor = "pointer";
+    this.statusBarItem.title = "Click to Reconnect";
 
-        this.statusBarItem.addEventListener("click", async () => {
-             await this.forceReconnect();
-        });
+    this.statusBarItem.addEventListener("click", async () => {
+      await this.forceReconnect();
+    });
 
-        this.registerInterval(
-            window.setInterval(() => {
-                this.updateStatusBar();
-            }, 5000)
+    this.registerInterval(
+      window.setInterval(() => {
+        this.updateStatusBar();
+      }, 5000),
+    );
+
+    this.updateStatusBar("disconnected");
+    this.addSettingTab(new CyberSyncSettingTab(this.app, this));
+
+    this.connectGlobalSocket();
+
+    // === VAULT EVENTS ===
+    this.registerEvent(
+      this.app.vault.on("create", (file) => this.onLocalFileCreate(file)),
+    );
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => this.onLocalFileDelete(file)),
+    );
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) =>
+        this.onLocalFileRename(file, oldPath),
+      ),
+    );
+
+    // === EDITOR SYNC ===
+    const pluginInstance = this;
+    const syncExtension = EditorView.updateListener.of((update: ViewUpdate) => {
+      if (!pluginInstance.isOnline) {
+        // ОФФЛАЙН: Записываем что делали изменения
+        const file = pluginInstance.app.workspace.getActiveFile();
+        if (file && update.docChanged) {
+          pluginInstance.settings.offlineChanges[file.path] = true;
+          pluginInstance.saveSettings();
+        }
+        return;
+      }
+
+      if (pluginInstance.globalSocket?.readyState !== WebSocket.OPEN) return;
+      if (update.transactions.some((tr) => tr.annotation(RemoteUpdate))) return;
+
+      const file = pluginInstance.app.workspace.getActiveFile();
+      if (!file) return;
+
+      if (update.docChanged) {
+        const newContent = update.state.doc.toString();
+        pluginInstance.globalSocket.send(
+          JSON.stringify({
+            type: "text_change",
+            filePath: file.path,
+            changes: update.changes.toJSON(),
+            clientId: pluginInstance.activeClientId,
+            version: pluginInstance.settings.fileVersions[file.path] || 0,
+          }),
         );
 
+        pluginInstance.settings.lastSyncedHash[file.path] =
+          pluginInstance.hashString(newContent);
+      }
+
+      if (update.selectionSet) {
+        const pos = update.state.selection.main.head;
+        pluginInstance.globalSocket.send(
+          JSON.stringify({
+            type: "cursor",
+            filePath: file.path,
+            pos: pos,
+            color: pluginInstance.color,
+            clientId: pluginInstance.activeClientId,
+          }),
+        );
+      }
+    });
+
+    this.registerEditorExtension([cursorField, syncExtension]);
+
+    this.app.workspace.on("file-open", (file) => {
+      if (file) {
+        // При открытии файла проверяем оффлайн изменения
+        const wasChangedOffline = this.settings.offlineChanges[file.path];
+        if (wasChangedOffline && this.isOnline) {
+          this.globalSocket?.send(
+            JSON.stringify({
+              type: "sync_offline_changes",
+              filePath: file.path,
+              clientId: this.activeClientId,
+            }),
+          );
+        }
+      }
+    });
+  }
+
+  onunload() {
+    console.log("CyberSync: Plugin Unloading...");
+    if (this.globalSocket) {
+      this.globalSocket.close();
+      this.globalSocket = null;
+    }
+    if (this.reconnectTimeout) {
+      window.clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+  }
+
+  async forceReconnect() {
+    new Notice("CyberSync: Reconnecting...");
+    if (this.globalSocket) {
+      this.globalSocket.close();
+      this.globalSocket = null;
+    }
+    this.isOnline = false;
+    this.updateStatusBar("disconnected");
+
+    setTimeout(() => {
+      this.connectGlobalSocket();
+    }, 500);
+  }
+
+  updateStatusBar(forceStatus?: string) {
+    this.statusBarItem.empty();
+    const icon = this.statusBarItem.createSpan({
+      cls: "cybersync-status-icon",
+    });
+
+    let text = "";
+    let color = "";
+
+    if (forceStatus === "connected") {
+      text = "● CyberSync: OK";
+      color = "var(--text-success)";
+    } else if (forceStatus === "disconnected") {
+      text = "× CyberSync: Off";
+      color = "var(--text-muted)";
+    } else if (this.isOnline) {
+      text = "● CyberSync: OK";
+      color = "var(--text-success)";
+    } else {
+      text = "⚠️ CyberSync: Offline";
+      color = "var(--text-warning)";
+    }
+
+    icon.setText(text);
+    icon.style.color = color;
+  }
+
+  onLocalFileCreate(file: TAbstractFile) {
+    if (this.isApplyingRemoteAction) return;
+    if (!(file instanceof TFile)) return;
+
+    console.log("CyberSync: Local Create ->", file.path);
+
+    if (this.isOnline) {
+      this.globalSocket?.send(
+        JSON.stringify({
+          type: "file_created",
+          filePath: file.path,
+          clientId: this.activeClientId,
+        }),
+      );
+    } else {
+      this.settings.offlineChanges[file.path] = true;
+      this.saveSettings();
+    }
+  }
+
+  onLocalFileDelete(file: TAbstractFile) {
+    if (this.isApplyingRemoteAction) return;
+    if (!(file instanceof TFile)) return;
+
+    console.log("CyberSync: Local Delete ->", file.path);
+
+    if (this.isOnline) {
+      this.globalSocket?.send(
+        JSON.stringify({
+          type: "file_deleted",
+          filePath: file.path,
+          clientId: this.activeClientId,
+        }),
+      );
+    }
+  }
+
+  onLocalFileRename(file: TAbstractFile, oldPath: string) {
+    if (this.isApplyingRemoteAction) return;
+    if (!(file instanceof TFile)) return;
+
+    console.log("CyberSync: Local Rename ->", oldPath, "to", file.path);
+
+    if (this.isOnline) {
+      this.globalSocket?.send(
+        JSON.stringify({
+          type: "file_renamed",
+          filePath: file.path,
+          oldPath: oldPath,
+          clientId: this.activeClientId,
+        }),
+      );
+    }
+  }
+
+  connectGlobalSocket() {
+    const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
+    const url = `${baseUrl}/ws?client_id=${encodeURIComponent(this.activeClientId)}&t=${Date.now()}`;
+
+    try {
+      if (this.globalSocket) {
+        this.globalSocket.close();
+      }
+
+      this.globalSocket = new WebSocket(url);
+
+      this.globalSocket.onopen = async () => {
+        console.log("CyberSync: 🌍✅ Connected!");
+        this.isOnline = true;
+        this.updateStatusBar("connected");
+
+        // Запрашиваем полное состояние хранилища
+        this.globalSocket?.send(
+          JSON.stringify({
+            type: "request_full_state",
+            clientId: this.activeClientId,
+            fileVersions: this.settings.fileVersions,
+          }),
+        );
+
+        // Отправляем оффлайн изменения
+        for (const [filePath, wasChanged] of Object.entries(
+          this.settings.offlineChanges,
+        )) {
+          if (wasChanged) {
+            const file = this.app.vault.getAbstractFileByPath(filePath);
+            if (file instanceof TFile) {
+              const content = await this.app.vault.read(file);
+              this.globalSocket?.send(
+                JSON.stringify({
+                  type: "sync_offline_changes",
+                  filePath: filePath,
+                  clientId: this.activeClientId,
+                  content: content,
+                  localVersion: this.settings.fileVersions[filePath] || 0,
+                }),
+              );
+            }
+          }
+        }
+      };
+
+      this.globalSocket.onmessage = async (event) => {
+        const msg = JSON.parse(event.data);
+
+        // Игнорируем свои сообщения (кроме ack и других системных)
+        if (
+          msg.clientId === this.activeClientId &&
+          !["ack", "conflict", "full_state"].includes(msg.type)
+        ) {
+          return;
+        }
+
+        console.log("CyberSync: Received:", msg.type, msg.filePath);
+
+        if (msg.type === "full_state") {
+          // Получили полное состояние при подключении
+          this.settings.fileVersions = msg.fileVersions || {};
+          this.settings.lastSyncedHash = msg.lastSyncedHashes || {};
+          await this.saveSettings();
+        } else if (msg.type === "text_change") {
+          await this.applyTextChange(msg);
+        } else if (msg.type === "file_created") {
+          this.isApplyingRemoteAction = true;
+          try {
+            if (!this.app.vault.getAbstractFileByPath(msg.filePath)) {
+              await this.createFolderRecursively(msg.filePath);
+              await this.app.vault.create(msg.filePath, "");
+              console.log("CyberSync: Remote Created ->", msg.filePath);
+              this.settings.fileVersions[msg.filePath] = msg.version || 0;
+              this.settings.lastSyncedHash[msg.filePath] = this.hashString("");
+              await this.saveSettings();
+            }
+          } finally {
+            this.isApplyingRemoteAction = false;
+          }
+        } else if (msg.type === "file_deleted") {
+          this.isApplyingRemoteAction = true;
+          try {
+            const file = this.app.vault.getAbstractFileByPath(msg.filePath);
+            if (file) {
+              await this.app.vault.delete(file);
+              console.log("CyberSync: Remote Deleted ->", msg.filePath);
+            }
+          } finally {
+            this.isApplyingRemoteAction = false;
+          }
+        } else if (msg.type === "file_renamed") {
+          this.isApplyingRemoteAction = true;
+          try {
+            const file = this.app.vault.getAbstractFileByPath(msg.oldPath);
+            if (file) {
+              await this.createFolderRecursively(msg.filePath);
+              await this.app.vault.rename(file, msg.filePath);
+              console.log(
+                "CyberSync: Remote Renamed ->",
+                msg.oldPath,
+                "to",
+                msg.filePath,
+              );
+              this.settings.fileVersions[msg.filePath] =
+                this.settings.fileVersions[msg.oldPath] || 0;
+              this.settings.lastSyncedHash[msg.filePath] =
+                this.settings.lastSyncedHash[msg.oldPath] || "";
+              delete this.settings.fileVersions[msg.oldPath];
+              delete this.settings.lastSyncedHash[msg.oldPath];
+              await this.saveSettings();
+            }
+          } finally {
+            this.isApplyingRemoteAction = false;
+          }
+        } else if (msg.type === "cursor") {
+          const file = this.app.workspace.getActiveFile();
+          if (file && file.path === msg.filePath) {
+            const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+            // @ts-ignore
+            const cm = view?.editor?.cm as EditorView;
+            if (cm) {
+              cm.dispatch({
+                effects: updateCursorEffect.of({
+                  pos: msg.pos,
+                  clientId: msg.clientId,
+                  color: msg.color,
+                  filePath: msg.filePath,
+                }),
+              });
+            }
+          }
+        } else if (msg.type === "disconnect") {
+          const file = this.app.workspace.getActiveFile();
+          if (file && file.path === msg.filePath) {
+            const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+            // @ts-ignore
+            const cm = view?.editor?.cm as EditorView;
+            if (cm) {
+              cm.dispatch({
+                effects: removeCursorEffect.of(msg.clientId),
+              });
+            }
+          }
+        } else if (msg.type === "conflict") {
+          // Конфликт: показываем обе версии
+          this.showMergeConflict(msg);
+        }
+      };
+
+      this.globalSocket.onclose = () => {
+        console.log("CyberSync: 🌍 Socket Closed");
+        this.isOnline = false;
         this.updateStatusBar("disconnected");
 
-        this.addSettingTab(new CyberSyncSettingTab(this.app, this));
-
-        this.connectVaultSocket();
-
-        this.registerEvent(this.app.vault.on("create", (file) => this.onLocalFileCreate(file)));
-        this.registerEvent(this.app.vault.on("delete", (file) => this.onLocalFileDelete(file)));
-        this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.onLocalFileRename(file, oldPath)));
-
-        const pluginInstance = this;
-        const syncExtension = EditorView.updateListener.of((update: ViewUpdate) => {
-            if (pluginInstance.fileSocket?.readyState !== WebSocket.OPEN) return;
-            if (update.transactions.some(tr => tr.annotation(RemoteUpdate))) return;
-
-            if (update.docChanged) {
-                pluginInstance.lastLocalChangeTime = Date.now();
-                pluginInstance.fileSocket.send(JSON.stringify({
-                    type: "text_change",
-                    changes: update.changes.toJSON(),
-                    clientId: pluginInstance.activeClientId,
-                }));
-                
-                // Обновить хеш после локального изменения
-                const activeFile = pluginInstance.app.workspace.getActiveFile();
-                if (activeFile) {
-                    const newContent = update.state.doc.toString();
-                    pluginInstance.settings.lastSyncedHash[activeFile.path] = pluginInstance.hashString(newContent);
-                }
-            }
-
-            if (update.selectionSet) {
-                if (!update.transactions.some(tr => tr.annotation(RemoteUpdate))) {
-                    const pos = update.state.selection.main.head;
-                    pluginInstance.fileSocket.send(JSON.stringify({
-                        type: "cursor",
-                        pos: pos,
-                        color: pluginInstance.color,
-                        clientId: pluginInstance.activeClientId,
-                    }));
-                }
-            }
-        });
-
-        this.registerEditorExtension([cursorField, syncExtension]);
-
-        this.app.workspace.on("file-open", (file) => {
-            if (file) this.connectFileSocket(file.path);
-            else {
-                if (this.fileSocket) this.fileSocket.close();
-                this.fileSocket = null;
-                this.updateStatusBar();
-            }
-        });
-
-        const activeFile = this.app.workspace.getActiveFile();
-        if (activeFile) this.connectFileSocket(activeFile.path);
-    }
-
-    onunload() {
-        console.log("CyberSync: Plugin Unloading...");
-        
-        // Очистить таймеры
-        if (this.vaultReconnectTimeout) {
-            window.clearTimeout(this.vaultReconnectTimeout);
-            this.vaultReconnectTimeout = null;
+        if (this.reconnectTimeout) {
+          window.clearTimeout(this.reconnectTimeout);
         }
-        if (this.fileReconnectTimeout) {
-            window.clearTimeout(this.fileReconnectTimeout);
-            this.fileReconnectTimeout = null;
-        }
-        
-        // Закрыть сокеты
-        if (this.vaultSocket) {
-            this.vaultSocket.close();
-            this.vaultSocket = null;
-        }
-        if (this.fileSocket) {
-            this.fileSocket.close();
-            this.fileSocket = null;
-        }
+        this.reconnectTimeout = window.setTimeout(() => {
+          console.log("CyberSync: Attempting to reconnect...");
+          this.connectGlobalSocket();
+        }, 3000);
+      };
+
+      this.globalSocket.onerror = (e) => {
+        console.error("CyberSync: Socket Error", e);
+      };
+    } catch (e) {
+      console.error("CyberSync: Connection Error", e);
     }
+  }
 
-    async forceReconnect() {
-        new Notice("CyberSync: Reconnecting...");
-        if (this.vaultSocket) { this.vaultSocket.close(); this.vaultSocket = null; }
-        if (this.fileSocket) { this.fileSocket.close(); this.fileSocket = null; }
+  private async applyTextChange(msg: any) {
+    const file = this.app.workspace.getActiveFile();
+    if (!file || file.path !== msg.filePath) return;
 
-        this.updateStatusBar("disconnected");
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) return;
 
-        setTimeout(() => {
-            this.connectVaultSocket();
-            const activeFile = this.app.workspace.getActiveFile();
-            if (activeFile) this.connectFileSocket(activeFile.path);
-        }, 500);
+    // @ts-ignore
+    const cm = view.editor.cm as EditorView;
+    if (!cm) return;
+
+    try {
+      const changeSet = ChangeSet.fromJSON(msg.changes);
+
+      const docLength = cm.state.doc.length;
+      if (changeSet.length !== docLength) {
+        console.warn(`CyberSync: Document mismatch. Requesting full state.`);
+        this.globalSocket?.send(
+          JSON.stringify({
+            type: "request_full_state",
+            clientId: this.activeClientId,
+            fileVersions: this.settings.fileVersions,
+          }),
+        );
+        return;
+      }
+
+      this.isApplyingRemoteAction = true;
+      cm.dispatch({
+        changes: changeSet,
+        annotations: [RemoteUpdate.of(true)],
+      });
+
+      this.settings.fileVersions[msg.filePath] = msg.version;
+      const newContent = cm.state.doc.toString();
+      this.settings.lastSyncedHash[msg.filePath] = this.hashString(newContent);
+      await this.saveSettings();
+    } catch (e) {
+      console.error("CyberSync: Failed to apply change", e);
+    } finally {
+      this.isApplyingRemoteAction = false;
     }
+  }
 
-    updateStatusBar(forceStatus?: string) {
-        this.statusBarItem.empty();
-        const icon = this.statusBarItem.createSpan({ cls: "cybersync-status-icon" });
+  private async showMergeConflict(msg: any) {
+    const file = this.app.workspace.getActiveFile();
+    if (!file || file.path !== msg.filePath) return;
 
-        let text = "";
-        let color = "";
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) return;
 
-        if (forceStatus) {
-            if (forceStatus === "connected") { text = "● CyberSync: OK"; color = "var(--text-success)"; }
-            else if (forceStatus === "syncing") { text = "↻ CyberSync: Sync"; color = "var(--text-warning)"; }
-            else if (forceStatus === "error") { text = "× CyberSync: Err"; color = "var(--text-error)"; }
-            else { text = "● CyberSync: Off"; color = "var(--text-muted)"; }
-        }
-        else {
-            const vaultReady = this.vaultSocket?.readyState === WebSocket.OPEN;
-            const fileReady = this.fileSocket?.readyState === WebSocket.OPEN;
-            const hasActiveFile = this.app.workspace.getActiveFile() !== null;
+    // Показываем diff в формате Git-like конфликтов, но по строкам
+    const merged = `<<<<<<< LOCAL (Your changes)
+${msg.localDiff}
+=======
+${msg.serverDiff}
+>>>>>>> SERVER (Latest)`;
 
-            if (vaultReady && (fileReady || !hasActiveFile)) {
-                text = "● CyberSync: OK";
-                color = "var(--text-success)";
-            } else if (vaultReady && hasActiveFile && !fileReady) {
-                text = "● CyberSync: No File";
-                color = "var(--text-warning)";
-            } else if (!vaultReady && fileReady) {
-                text = "● CyberSync: No Vault";
-                color = "var(--text-warning)";
-            } else if (!vaultReady && !fileReady) {
-                text = "× CyberSync: Off";
-                color = "var(--text-muted)";
-            } else {
-                 text = "● CyberSync: Check";
-                 color = "var(--text-muted)";
-            }
-        }
+    view.editor.setValue(merged);
+    new Notice(
+      "⚠️ CyberSync: Merge conflict! Resolve manually and save.",
+      10000,
+    );
+  }
 
-        icon.setText(text);
-        icon.style.color = color;
+  async createFolderRecursively(path: string) {
+    const folders = path.split("/").slice(0, -1);
+    if (folders.length === 0) return;
+
+    let current = "";
+    for (const folder of folders) {
+      current = current === "" ? folder : current + "/" + folder;
+      if (!this.app.vault.getAbstractFileByPath(current)) {
+        await this.app.vault.createFolder(current);
+      }
     }
+  }
 
-    sendVaultMessage(msg: any) {
-        const json = JSON.stringify(msg);
-        if (this.vaultSocket && this.vaultSocket.readyState === WebSocket.OPEN) {
-            this.vaultSocket.send(json);
-        } else {
-            this.vaultMessageQueue.push(json);
-        }
+  updateActiveClientId() {
+    if (!this.settings.clientId) {
+      this.settings.clientId =
+        "client-" + Math.random().toString(36).substr(2, 9);
+      this.saveSettings();
     }
+    this.activeClientId = this.settings.clientId;
+  }
 
-    onLocalFileCreate(file: TAbstractFile) {
-        if (this.isApplyingRemoteVaultAction) return;
-        if (!(file instanceof TFile)) return;
-        console.log("CyberSync: Local Create Detected ->", file.path);
-        this.sendVaultMessage({ type: "file_created", path: file.path });
-    }
+  async loadSettings() {
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
 
-    onLocalFileDelete(file: TAbstractFile) {
-        if (this.isApplyingRemoteVaultAction) return;
-        if (!(file instanceof TFile)) return;
-        console.log("CyberSync: Local Delete Detected ->", file.path);
-        this.sendVaultMessage({ type: "file_deleted", path: file.path });
-    }
-
-    onLocalFileRename(file: TAbstractFile, oldPath: string) {
-        if (this.isApplyingRemoteVaultAction) return;
-        if (!(file instanceof TFile)) return;
-        console.log("CyberSync: Local Rename Detected ->", oldPath, "to", file.path);
-        this.sendVaultMessage({ type: "file_renamed", path: file.path, oldPath: oldPath });
-    }
-
-    connectVaultSocket() {
-        const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
-        const url = `${baseUrl}/ws?file_id=__global__&client_id=${encodeURIComponent(this.activeClientId)}&t=${Date.now()}`;
-
-        try {
-            if (this.vaultSocket) {
-                this.vaultSocket.close();
-            }
-
-            this.vaultSocket = new WebSocket(url);
-
-            this.vaultSocket.onopen = () => {
-                console.log("CyberSync: 🌍✅ Connected to Global Vault!");
-                this.updateStatusBar();
-
-                // Запросить полную синхронизацию при подключении
-                this.vaultSocket?.send(JSON.stringify({
-                    type: "request_sync",
-                    clientId: this.activeClientId
-                }));
-
-                while (this.vaultMessageQueue.length > 0) {
-                    const msg = this.vaultMessageQueue.shift();
-                    if (msg) this.vaultSocket?.send(msg);
-                }
-            };
-
-            this.vaultSocket.onmessage = async (event) => {
-                const data = JSON.parse(event.data);
-                
-                // Разрешить vault_sync_init независимо от clientId
-                if (data.type !== "vault_sync_init" && data.clientId === this.activeClientId) {
-                    return;
-                }
-
-                console.log("CyberSync: 🌍 Received Vault Event:", data.type, data.path);
-
-                this.isApplyingRemoteVaultAction = true;
-                try {
-                    if (data.type === "vault_sync_init") {
-                        const serverFiles: string[] = data.files || [];
-                        console.log("CyberSync: Initial Sync. Files:", serverFiles.length);
-                        for (const path of serverFiles) {
-                            const existingFile = this.app.vault.getAbstractFileByPath(path);
-                            if (!existingFile) {
-                                try {
-                                    await this.createFolderRecursively(path);
-                                    // Двойная проверка перед созданием
-                                    if (!this.app.vault.getAbstractFileByPath(path)) {
-                                        await this.app.vault.create(path, "");
-                                        console.log("CyberSync: Synced missing file:", path);
-                                    }
-                                } catch (e) { 
-                                    // Игнорировать ошибку если файл уже существует
-                                    if (!e.message?.includes("already exists")) {
-                                        console.warn("Failed to sync file:", path, e);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    else if (data.type === "file_created") {
-                        if (!this.app.vault.getAbstractFileByPath(data.path)) {
-                            await this.createFolderRecursively(data.path);
-                            await this.app.vault.create(data.path, "");
-                            console.log("CyberSync: Remote Created ->", data.path);
-                        }
-                    }
-                    else if (data.type === "file_deleted") {
-                        const file = this.app.vault.getAbstractFileByPath(data.path);
-                        if (file) {
-                            await this.app.vault.delete(file);
-                            console.log("CyberSync: Remote Deleted ->", data.path);
-                        }
-                    }
-                    else if (data.type === "file_renamed") {
-                        const file = this.app.vault.getAbstractFileByPath(data.oldPath);
-                        if (file) {
-                            await this.createFolderRecursively(data.path);
-                            await this.app.vault.rename(file, data.path);
-                            console.log("CyberSync: Remote Renamed ->", data.oldPath, "to", data.path);
-                        }
-                    }
-                } catch (e) {
-                    console.error("CyberSync: Error applying vault action:", e);
-                } finally {
-                    this.isApplyingRemoteVaultAction = false;
-                }
-            };
-
-            this.vaultSocket.onclose = () => {
-                console.log("CyberSync: 🌍 Vault Socket Closed");
-                this.updateStatusBar("disconnected");
-                
-                // Автоматическое переподключение через 3 секунды
-                if (this.vaultReconnectTimeout) {
-                    window.clearTimeout(this.vaultReconnectTimeout);
-                }
-                this.vaultReconnectTimeout = window.setTimeout(() => {
-                    console.log("CyberSync: Attempting to reconnect vault socket...");
-                    this.connectVaultSocket();
-                }, 3000);
-            };
-
-            this.vaultSocket.onerror = (e) => {
-                console.error("CyberSync: 🌍 Vault Socket Error", e);
-                this.updateStatusBar("error");
-            };
-
-        } catch (e) {
-            console.error("CyberSync: Vault Connect Failed", e);
-            this.updateStatusBar("error");
-        }
-    }
-
-    async createFolderRecursively(path: string) {
-        const folders = path.split("/").slice(0, -1);
-        if (folders.length === 0) return;
-
-        let current = "";
-        for (const folder of folders) {
-            current = current === "" ? folder : current + "/" + folder;
-            if (!this.app.vault.getAbstractFileByPath(current)) {
-                await this.app.vault.createFolder(current);
-            }
-        }
-    }
-
-    connectFileSocket(filepath: string) {
-         this.currentFilePath = filepath;
-         
-         if (this.fileSocket) {
-             this.fileSocket.close();
-             this.fileSocket = null;
-         }
-         
-         if (this.fileReconnectTimeout) {
-             window.clearTimeout(this.fileReconnectTimeout);
-             this.fileReconnectTimeout = null;
-         }
-
-         const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
-         const url = `${baseUrl}/ws?file_id=${encodeURIComponent(filepath)}&client_id=${encodeURIComponent(this.activeClientId)}`;
-
-         try {
-             this.fileSocket = new WebSocket(url);
-
-            this.fileSocket.onopen = async () => {
-                console.log("CyberSync: File Connected:", filepath);
-                this.updateStatusBar("connected");
-
-                // Получить текущее локальное содержимое
-                const file = this.app.workspace.getActiveFile();
-                if (!file || file.path !== filepath) return;
-                
-                const localContent = await this.app.vault.read(file);
-                const localHash = this.hashString(localContent);
-                const lastSyncedHash = this.settings.lastSyncedHash[filepath];
-                const localVersion = this.settings.fileVersions[filepath] || 0;
-                
-                const localChanged = lastSyncedHash !== undefined && localHash !== lastSyncedHash;
-                
-                console.log(`CyberSync: Sync check - localChanged=${localChanged}, localHash=${localHash}, lastSyncedHash=${lastSyncedHash}`);
-                
-                // Запросить снепшот с сервера с информацией о локальных изменениях
-                this.fileSocket.send(JSON.stringify({
-                    type: "sync_request",
-                    clientId: this.activeClientId,
-                    localVersion: localVersion,
-                    localHash: localHash,
-                    localChanged: localChanged,
-                    localContent: localChanged ? localContent : undefined
-                }));
-            };
-
-             this.fileSocket.onmessage = async (event) => {
-                 const msg = JSON.parse(event.data);
-                 if (msg.clientId === this.activeClientId && msg.type !== "ack") return;
-
-                 if (msg.type === "text_change") {
-                     const file = this.app.workspace.getActiveFile();
-                     if (!file || file.path !== filepath) return;
-
-                     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-                     if (!view) return;
-
-                     // @ts-ignore
-                     const cm = view.editor.cm as EditorView;
-                     if (cm) {
-                         try {
-                             const changeSet = ChangeSet.fromJSON(msg.changes);
-                             
-                             // Проверить что длина документа подходит для применения патча
-                             const docLength = cm.state.doc.length;
-                             if (changeSet.length !== docLength) {
-                                 console.warn(`CyberSync: Document length mismatch (local=${docLength}, expected=${changeSet.length}). Reconnecting to resolve conflict.`);
-                                 // Переподключиться чтобы запустить sync_request заново
-                                 this.fileSocket?.close();
-                                 setTimeout(() => this.connectFileSocket(filepath), 500);
-                                 return;
-                             }
-                             
-                             cm.dispatch({
-                                 changes: changeSet,
-                                 annotations: [RemoteUpdate.of(true)]
-                             });
-
-                             this.settings.fileVersions[filepath] = msg.version;
-                             // Обновить хеш после применения патча
-                             const newContent = cm.state.doc.toString();
-                             this.settings.lastSyncedHash[filepath] = this.hashString(newContent);
-                             await this.saveSettings();
-                         } catch (e) {
-                             console.error("CyberSync: Failed to apply patches", e);
-                             // При ошибке применения патча переподключиться
-                             this.fileSocket?.close();
-                             setTimeout(() => this.connectFileSocket(filepath), 500);
-                         }
-                     }
-                 }
-                 else if (msg.type === "ack") {
-                     this.settings.fileVersions[filepath] = msg.version;
-                     
-                     // Отправить snapshot hint чтобы обновить полный текст на сервере
-                     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-                     if (view) {
-                         const currentContent = view.editor.getValue();
-                         this.fileSocket?.send(JSON.stringify({
-                             type: "snapshot_hint",
-                             content: currentContent,
-                             version: msg.version,
-                             clientId: this.activeClientId
-                         }));
-                     }
-                     
-                     await this.saveSettings();
-                 }
-                 else if (msg.type === "full_sync") {
-                     const file = this.app.workspace.getActiveFile();
-                     if (file && file.path === filepath) {
-                         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-                         if (view) {
-                             if (msg.conflict) {
-                                 // Конфликт: сделать merge с маркерами
-                                 const localContent = view.editor.getValue();
-                                 const serverContent = msg.content;
-                                 
-                                 const mergedContent = 
-                                     `server\n---\n${serverContent}\n---\n\n` +
-                                     `local\n---\n${localContent}\n---`;
-                                 
-                                 view.editor.setValue(mergedContent);
-                                 new Notice("⚠️ CyberSync: Conflict detected! Please resolve manually.", 8000);
-                                 console.warn(`CyberSync: Conflict - merged with markers`);
-                             } else {
-                                 view.editor.setValue(msg.content);
-                                 console.log(`CyberSync: Full sync applied, version=${msg.version}`);
-                             }
-                             
-                             this.settings.fileVersions[filepath] = msg.version;
-                             this.settings.lastSyncedHash[filepath] = this.hashString(view.editor.getValue());
-                             await this.saveSettings();
-                         }
-                     }
-                 }
-                 else if (msg.type === "cursor") {
-                     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-                     // @ts-ignore
-                     const cm = view?.editor?.cm as EditorView;
-                     if (cm) {
-                         cm.dispatch({
-                             effects: updateCursorEffect.of({
-                                 pos: msg.pos,
-                                 clientId: msg.clientId,
-                                 color: msg.color
-                             })
-                         });
-                     }
-                 }
-                 else if (msg.type === "disconnect") {
-                      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-                      // @ts-ignore
-                      const cm = view?.editor?.cm as EditorView;
-                      if (cm) {
-                          cm.dispatch({
-                              effects: removeCursorEffect.of(msg.clientId)
-                          });
-                      }
-                 }
-             };
-
-             this.fileSocket.onclose = () => {
-                 console.log("CyberSync: File Socket Closed:", filepath);
-                 this.updateStatusBar();
-                 
-                 // Автоматическое переподключение если файл все еще открыт
-                 const activeFile = this.app.workspace.getActiveFile();
-                 if (activeFile && activeFile.path === filepath) {
-                     if (this.fileReconnectTimeout) {
-                         window.clearTimeout(this.fileReconnectTimeout);
-                     }
-                     this.fileReconnectTimeout = window.setTimeout(() => {
-                         console.log("CyberSync: Attempting to reconnect file socket:", filepath);
-                         this.connectFileSocket(filepath);
-                     }, 3000);
-                 }
-             };
-             
-             this.fileSocket.onerror = (e) => {
-                 console.error("CyberSync: File Socket Error:", filepath, e);
-             };
-
-         } catch (e) {
-             console.error("CyberSync: File Connect Error", e);
-         }
-    }
-
-    updateActiveClientId() {
-        if (!this.settings.clientId) {
-            this.settings.clientId = "client-" + Math.random().toString(36).substr(2, 9);
-            this.saveSettings();
-        }
-        this.activeClientId = this.settings.clientId;
-    }
-
-    async loadSettings() {
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    }
-
-    async saveSettings() {
-        await this.saveData(this.settings);
-    }
+  async saveSettings() {
+    await this.saveData(this.settings);
+  }
 }
 
 class CyberSyncSettingTab extends PluginSettingTab {
-    plugin: SyncPlugin;
+  plugin: SyncPlugin;
 
-    constructor(app: App, plugin: SyncPlugin) {
-        super(app, plugin);
-        this.plugin = plugin;
-    }
+  constructor(app: App, plugin: SyncPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
 
-    display(): void {
-        const { containerEl } = this;
-        containerEl.empty();
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
 
-        containerEl.createEl("h2", { text: "CyberSync Settings" });
+    containerEl.createEl("h2", { text: "CyberSync Settings" });
 
-        new Setting(containerEl)
-            .setName("Server URL")
-            .setDesc("Address of the python server")
-            .addText(text => text
-                .setPlaceholder("ws://localhost:8000")
-                .setValue(this.plugin.settings.serverUrl)
-                .onChange(async (value) => {
-                    this.plugin.settings.serverUrl = value;
-                    await this.plugin.saveSettings();
-                    this.plugin.forceReconnect();
-                }));
+    new Setting(containerEl)
+      .setName("Server URL")
+      .setDesc("WebSocket server address")
+      .addText((text) =>
+        text
+          .setPlaceholder("ws://localhost:8000")
+          .setValue(this.plugin.settings.serverUrl)
+          .onChange(async (value) => {
+            this.plugin.settings.serverUrl = value;
+            await this.plugin.saveSettings();
+            this.plugin.forceReconnect();
+          }),
+      );
 
-        new Setting(containerEl)
-            .setName("Client ID")
-            .setDesc("Unique ID for this device")
-            .addText(text => text
-                .setPlaceholder("client-123")
-                .setValue(this.plugin.settings.clientId)
-                .onChange(async (value) => {
-                    this.plugin.settings.clientId = value;
-                    await this.plugin.saveSettings();
-                    this.plugin.updateActiveClientId();
-                    this.plugin.forceReconnect();
-                }));
-    }
+    new Setting(containerEl)
+      .setName("Client ID")
+      .setDesc("Unique ID for this device")
+      .addText((text) =>
+        text
+          .setPlaceholder("client-123")
+          .setValue(this.plugin.settings.clientId)
+          .onChange(async (value) => {
+            this.plugin.settings.clientId = value;
+            await this.plugin.saveSettings();
+            this.plugin.updateActiveClientId();
+            this.plugin.forceReconnect();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Reset Cache")
+      .setDesc("Clear all sync data")
+      .addButton((btn) =>
+        btn
+          .setButtonText("Reset")
+          .setWarning()
+          .onClick(async () => {
+            this.plugin.settings.fileVersions = {};
+            this.plugin.settings.lastSyncedHash = {};
+            this.plugin.settings.offlineChanges = {};
+            await this.plugin.saveSettings();
+            new Notice("CyberSync: Cache cleared!");
+            await this.plugin.forceReconnect();
+          }),
+      );
+  }
 }

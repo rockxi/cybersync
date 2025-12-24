@@ -107,6 +107,9 @@ export default class SyncPlugin extends Plugin {
     vaultSocket: WebSocket | null = null;
 
     private vaultMessageQueue: string[] = [];
+    private vaultReconnectTimeout: number | null = null;
+    private fileReconnectTimeout: number | null = null;
+    private currentFilePath: string | null = null;
 
     activeClientId: string;
     color: string = "#" + Math.floor(Math.random() * 16777215).toString(16);
@@ -187,6 +190,30 @@ export default class SyncPlugin extends Plugin {
 
         const activeFile = this.app.workspace.getActiveFile();
         if (activeFile) this.connectFileSocket(activeFile.path);
+    }
+
+    onunload() {
+        console.log("CyberSync: Plugin Unloading...");
+        
+        // Очистить таймеры
+        if (this.vaultReconnectTimeout) {
+            window.clearTimeout(this.vaultReconnectTimeout);
+            this.vaultReconnectTimeout = null;
+        }
+        if (this.fileReconnectTimeout) {
+            window.clearTimeout(this.fileReconnectTimeout);
+            this.fileReconnectTimeout = null;
+        }
+        
+        // Закрыть сокеты
+        if (this.vaultSocket) {
+            this.vaultSocket.close();
+            this.vaultSocket = null;
+        }
+        if (this.fileSocket) {
+            this.fileSocket.close();
+            this.fileSocket = null;
+        }
     }
 
     async forceReconnect() {
@@ -288,6 +315,12 @@ export default class SyncPlugin extends Plugin {
                 console.log("CyberSync: 🌍✅ Connected to Global Vault!");
                 this.updateStatusBar();
 
+                // Запросить полную синхронизацию при подключении
+                this.vaultSocket?.send(JSON.stringify({
+                    type: "request_sync",
+                    clientId: this.activeClientId
+                }));
+
                 while (this.vaultMessageQueue.length > 0) {
                     const msg = this.vaultMessageQueue.shift();
                     if (msg) this.vaultSocket?.send(msg);
@@ -296,7 +329,11 @@ export default class SyncPlugin extends Plugin {
 
             this.vaultSocket.onmessage = async (event) => {
                 const data = JSON.parse(event.data);
-                if (data.clientId === this.activeClientId) return;
+                
+                // Разрешить vault_sync_init независимо от clientId
+                if (data.type !== "vault_sync_init" && data.clientId === this.activeClientId) {
+                    return;
+                }
 
                 console.log("CyberSync: 🌍 Received Vault Event:", data.type, data.path);
 
@@ -306,12 +343,21 @@ export default class SyncPlugin extends Plugin {
                         const serverFiles: string[] = data.files || [];
                         console.log("CyberSync: Initial Sync. Files:", serverFiles.length);
                         for (const path of serverFiles) {
-                            if (!this.app.vault.getAbstractFileByPath(path)) {
+                            const existingFile = this.app.vault.getAbstractFileByPath(path);
+                            if (!existingFile) {
                                 try {
                                     await this.createFolderRecursively(path);
-                                    await this.app.vault.create(path, "");
-                                    console.log("CyberSync: Synced missing file:", path);
-                                } catch (e) { console.warn("Failed to sync file:", path, e); }
+                                    // Двойная проверка перед созданием
+                                    if (!this.app.vault.getAbstractFileByPath(path)) {
+                                        await this.app.vault.create(path, "");
+                                        console.log("CyberSync: Synced missing file:", path);
+                                    }
+                                } catch (e) { 
+                                    // Игнорировать ошибку если файл уже существует
+                                    if (!e.message?.includes("already exists")) {
+                                        console.warn("Failed to sync file:", path, e);
+                                    }
+                                }
                             }
                         }
                     }
@@ -347,6 +393,15 @@ export default class SyncPlugin extends Plugin {
             this.vaultSocket.onclose = () => {
                 console.log("CyberSync: 🌍 Vault Socket Closed");
                 this.updateStatusBar("disconnected");
+                
+                // Автоматическое переподключение через 3 секунды
+                if (this.vaultReconnectTimeout) {
+                    window.clearTimeout(this.vaultReconnectTimeout);
+                }
+                this.vaultReconnectTimeout = window.setTimeout(() => {
+                    console.log("CyberSync: Attempting to reconnect vault socket...");
+                    this.connectVaultSocket();
+                }, 3000);
             };
 
             this.vaultSocket.onerror = (e) => {
@@ -374,9 +429,16 @@ export default class SyncPlugin extends Plugin {
     }
 
     connectFileSocket(filepath: string) {
+         this.currentFilePath = filepath;
+         
          if (this.fileSocket) {
              this.fileSocket.close();
              this.fileSocket = null;
+         }
+         
+         if (this.fileReconnectTimeout) {
+             window.clearTimeout(this.fileReconnectTimeout);
+             this.fileReconnectTimeout = null;
          }
 
          const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
@@ -385,16 +447,16 @@ export default class SyncPlugin extends Plugin {
          try {
              this.fileSocket = new WebSocket(url);
 
-             this.fileSocket.onopen = () => {
-                 console.log("CyberSync: File Connected:", filepath);
-                 this.updateStatusBar("connected");
+            this.fileSocket.onopen = () => {
+                console.log("CyberSync: File Connected:", filepath);
+                this.updateStatusBar("connected");
 
-                 const ver = this.settings.fileVersions[filepath] || 0;
-                 this.fileSocket.send(JSON.stringify({
-                     type: "handshake",
-                     version: ver
-                 }));
-             };
+                // Запросить полную синхронизацию
+                this.fileSocket.send(JSON.stringify({
+                    type: "request_full_sync",
+                    clientId: this.activeClientId
+                }));
+            };
 
              this.fileSocket.onmessage = async (event) => {
                  const msg = JSON.parse(event.data);
@@ -466,7 +528,24 @@ export default class SyncPlugin extends Plugin {
              };
 
              this.fileSocket.onclose = () => {
+                 console.log("CyberSync: File Socket Closed:", filepath);
                  this.updateStatusBar();
+                 
+                 // Автоматическое переподключение если файл все еще открыт
+                 const activeFile = this.app.workspace.getActiveFile();
+                 if (activeFile && activeFile.path === filepath) {
+                     if (this.fileReconnectTimeout) {
+                         window.clearTimeout(this.fileReconnectTimeout);
+                     }
+                     this.fileReconnectTimeout = window.setTimeout(() => {
+                         console.log("CyberSync: Attempting to reconnect file socket:", filepath);
+                         this.connectFileSocket(filepath);
+                     }, 3000);
+                 }
+             };
+             
+             this.fileSocket.onerror = (e) => {
+                 console.error("CyberSync: File Socket Error:", filepath, e);
              };
 
          } catch (e) {

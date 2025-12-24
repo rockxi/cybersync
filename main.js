@@ -94,6 +94,9 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "fileSocket", null);
     __publicField(this, "vaultSocket", null);
     __publicField(this, "vaultMessageQueue", []);
+    __publicField(this, "vaultReconnectTimeout", null);
+    __publicField(this, "fileReconnectTimeout", null);
+    __publicField(this, "currentFilePath", null);
     __publicField(this, "activeClientId");
     __publicField(this, "color", "#" + Math.floor(Math.random() * 16777215).toString(16));
     __publicField(this, "statusBarItem");
@@ -159,6 +162,25 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     });
     const activeFile = this.app.workspace.getActiveFile();
     if (activeFile) this.connectFileSocket(activeFile.path);
+  }
+  onunload() {
+    console.log("CyberSync: Plugin Unloading...");
+    if (this.vaultReconnectTimeout) {
+      window.clearTimeout(this.vaultReconnectTimeout);
+      this.vaultReconnectTimeout = null;
+    }
+    if (this.fileReconnectTimeout) {
+      window.clearTimeout(this.fileReconnectTimeout);
+      this.fileReconnectTimeout = null;
+    }
+    if (this.vaultSocket) {
+      this.vaultSocket.close();
+      this.vaultSocket = null;
+    }
+    if (this.fileSocket) {
+      this.fileSocket.close();
+      this.fileSocket = null;
+    }
   }
   async forceReconnect() {
     new import_obsidian.Notice("CyberSync: Reconnecting...");
@@ -256,17 +278,24 @@ var SyncPlugin = class extends import_obsidian.Plugin {
       }
       this.vaultSocket = new WebSocket(url);
       this.vaultSocket.onopen = () => {
-        var _a;
+        var _a, _b;
         console.log("CyberSync: \u{1F30D}\u2705 Connected to Global Vault!");
         this.updateStatusBar();
+        (_a = this.vaultSocket) == null ? void 0 : _a.send(JSON.stringify({
+          type: "request_sync",
+          clientId: this.activeClientId
+        }));
         while (this.vaultMessageQueue.length > 0) {
           const msg = this.vaultMessageQueue.shift();
-          if (msg) (_a = this.vaultSocket) == null ? void 0 : _a.send(msg);
+          if (msg) (_b = this.vaultSocket) == null ? void 0 : _b.send(msg);
         }
       };
       this.vaultSocket.onmessage = async (event) => {
+        var _a;
         const data = JSON.parse(event.data);
-        if (data.clientId === this.activeClientId) return;
+        if (data.type !== "vault_sync_init" && data.clientId === this.activeClientId) {
+          return;
+        }
         console.log("CyberSync: \u{1F30D} Received Vault Event:", data.type, data.path);
         this.isApplyingRemoteVaultAction = true;
         try {
@@ -274,13 +303,18 @@ var SyncPlugin = class extends import_obsidian.Plugin {
             const serverFiles = data.files || [];
             console.log("CyberSync: Initial Sync. Files:", serverFiles.length);
             for (const path of serverFiles) {
-              if (!this.app.vault.getAbstractFileByPath(path)) {
+              const existingFile = this.app.vault.getAbstractFileByPath(path);
+              if (!existingFile) {
                 try {
                   await this.createFolderRecursively(path);
-                  await this.app.vault.create(path, "");
-                  console.log("CyberSync: Synced missing file:", path);
+                  if (!this.app.vault.getAbstractFileByPath(path)) {
+                    await this.app.vault.create(path, "");
+                    console.log("CyberSync: Synced missing file:", path);
+                  }
                 } catch (e) {
-                  console.warn("Failed to sync file:", path, e);
+                  if (!((_a = e.message) == null ? void 0 : _a.includes("already exists"))) {
+                    console.warn("Failed to sync file:", path, e);
+                  }
                 }
               }
             }
@@ -313,6 +347,13 @@ var SyncPlugin = class extends import_obsidian.Plugin {
       this.vaultSocket.onclose = () => {
         console.log("CyberSync: \u{1F30D} Vault Socket Closed");
         this.updateStatusBar("disconnected");
+        if (this.vaultReconnectTimeout) {
+          window.clearTimeout(this.vaultReconnectTimeout);
+        }
+        this.vaultReconnectTimeout = window.setTimeout(() => {
+          console.log("CyberSync: Attempting to reconnect vault socket...");
+          this.connectVaultSocket();
+        }, 3e3);
       };
       this.vaultSocket.onerror = (e) => {
         console.error("CyberSync: \u{1F30D} Vault Socket Error", e);
@@ -335,9 +376,14 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     }
   }
   connectFileSocket(filepath) {
+    this.currentFilePath = filepath;
     if (this.fileSocket) {
       this.fileSocket.close();
       this.fileSocket = null;
+    }
+    if (this.fileReconnectTimeout) {
+      window.clearTimeout(this.fileReconnectTimeout);
+      this.fileReconnectTimeout = null;
     }
     const baseUrl = this.settings.serverUrl.replace(/\/$/, "");
     const url = `${baseUrl}/ws?file_id=${encodeURIComponent(filepath)}&client_id=${encodeURIComponent(this.activeClientId)}`;
@@ -346,10 +392,9 @@ var SyncPlugin = class extends import_obsidian.Plugin {
       this.fileSocket.onopen = () => {
         console.log("CyberSync: File Connected:", filepath);
         this.updateStatusBar("connected");
-        const ver = this.settings.fileVersions[filepath] || 0;
         this.fileSocket.send(JSON.stringify({
-          type: "handshake",
-          version: ver
+          type: "request_full_sync",
+          clientId: this.activeClientId
         }));
       };
       this.fileSocket.onmessage = async (event) => {
@@ -411,7 +456,21 @@ var SyncPlugin = class extends import_obsidian.Plugin {
         }
       };
       this.fileSocket.onclose = () => {
+        console.log("CyberSync: File Socket Closed:", filepath);
         this.updateStatusBar();
+        const activeFile = this.app.workspace.getActiveFile();
+        if (activeFile && activeFile.path === filepath) {
+          if (this.fileReconnectTimeout) {
+            window.clearTimeout(this.fileReconnectTimeout);
+          }
+          this.fileReconnectTimeout = window.setTimeout(() => {
+            console.log("CyberSync: Attempting to reconnect file socket:", filepath);
+            this.connectFileSocket(filepath);
+          }, 3e3);
+        }
+      };
+      this.fileSocket.onerror = (e) => {
+        console.error("CyberSync: File Socket Error:", filepath, e);
       };
     } catch (e) {
       console.error("CyberSync: File Connect Error", e);

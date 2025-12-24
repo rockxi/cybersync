@@ -542,6 +542,19 @@ export default class SyncPlugin extends Plugin {
                  }
                  else if (msg.type === "ack") {
                      this.settings.fileVersions[filepath] = msg.version;
+                     
+                     // Отправить snapshot hint чтобы обновить полный текст на сервере
+                     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+                     if (view) {
+                         const currentContent = view.editor.getValue();
+                         this.fileSocket?.send(JSON.stringify({
+                             type: "snapshot_hint",
+                             content: currentContent,
+                             version: msg.version,
+                             clientId: this.activeClientId
+                         }));
+                     }
+                     
                      await this.saveSettings();
                  }
                  else if (msg.type === "full_sync") {

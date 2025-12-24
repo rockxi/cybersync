@@ -426,7 +426,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
         }));
       };
       this.fileSocket.onmessage = async (event) => {
-        var _a, _b, _c, _d;
+        var _a, _b, _c, _d, _e;
         const msg = JSON.parse(event.data);
         if (msg.clientId === this.activeClientId && msg.type !== "ack") return;
         if (msg.type === "text_change") {
@@ -461,6 +461,16 @@ var SyncPlugin = class extends import_obsidian.Plugin {
           }
         } else if (msg.type === "ack") {
           this.settings.fileVersions[filepath] = msg.version;
+          const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+          if (view) {
+            const currentContent = view.editor.getValue();
+            (_c = this.fileSocket) == null ? void 0 : _c.send(JSON.stringify({
+              type: "snapshot_hint",
+              content: currentContent,
+              version: msg.version,
+              clientId: this.activeClientId
+            }));
+          }
           await this.saveSettings();
         } else if (msg.type === "full_sync") {
           const file = this.app.workspace.getActiveFile();
@@ -493,7 +503,7 @@ ${localContent}
           }
         } else if (msg.type === "cursor") {
           const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
-          const cm = (_c = view == null ? void 0 : view.editor) == null ? void 0 : _c.cm;
+          const cm = (_d = view == null ? void 0 : view.editor) == null ? void 0 : _d.cm;
           if (cm) {
             cm.dispatch({
               effects: updateCursorEffect.of({
@@ -505,7 +515,7 @@ ${localContent}
           }
         } else if (msg.type === "disconnect") {
           const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
-          const cm = (_d = view == null ? void 0 : view.editor) == null ? void 0 : _d.cm;
+          const cm = (_e = view == null ? void 0 : view.editor) == null ? void 0 : _e.cm;
           if (cm) {
             cm.dispatch({
               effects: removeCursorEffect.of(msg.clientId)

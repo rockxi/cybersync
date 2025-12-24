@@ -30,7 +30,8 @@ var import_view = require("@codemirror/view");
 var DEFAULT_SETTINGS = {
   serverUrl: "ws://localhost:8000",
   clientId: "",
-  fileVersions: {}
+  fileVersions: {},
+  lastSyncedHash: {}
 };
 var RemoteUpdate = import_state.Annotation.define();
 var updateCursorEffect = import_state.StateEffect.define();
@@ -104,6 +105,16 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     __publicField(this, "lastLocalChangeTime", 0);
     __publicField(this, "isApplyingRemoteVaultAction", false);
   }
+  // Простая функция хеширования
+  hashString(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = (hash << 5) - hash + char;
+      hash = hash & hash;
+    }
+    return hash.toString(36);
+  }
   async onload() {
     console.log("CyberSync: Plugin Loading...");
     await this.loadSettings();
@@ -138,6 +149,11 @@ var SyncPlugin = class extends import_obsidian.Plugin {
           changes: update.changes.toJSON(),
           clientId: pluginInstance.activeClientId
         }));
+        const activeFile2 = pluginInstance.app.workspace.getActiveFile();
+        if (activeFile2) {
+          const newContent = update.state.doc.toString();
+          pluginInstance.settings.lastSyncedHash[activeFile2.path] = pluginInstance.hashString(newContent);
+        }
       }
       if (update.selectionSet) {
         if (!update.transactions.some((tr) => tr.annotation(RemoteUpdate))) {
@@ -389,16 +405,28 @@ var SyncPlugin = class extends import_obsidian.Plugin {
     const url = `${baseUrl}/ws?file_id=${encodeURIComponent(filepath)}&client_id=${encodeURIComponent(this.activeClientId)}`;
     try {
       this.fileSocket = new WebSocket(url);
-      this.fileSocket.onopen = () => {
+      this.fileSocket.onopen = async () => {
         console.log("CyberSync: File Connected:", filepath);
         this.updateStatusBar("connected");
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.path !== filepath) return;
+        const localContent = await this.app.vault.read(file);
+        const localHash = this.hashString(localContent);
+        const lastSyncedHash = this.settings.lastSyncedHash[filepath];
+        const localVersion = this.settings.fileVersions[filepath] || 0;
+        const localChanged = lastSyncedHash !== void 0 && localHash !== lastSyncedHash;
+        console.log(`CyberSync: Sync check - localChanged=${localChanged}, localHash=${localHash}, lastSyncedHash=${lastSyncedHash}`);
         this.fileSocket.send(JSON.stringify({
-          type: "request_full_sync",
-          clientId: this.activeClientId
+          type: "sync_request",
+          clientId: this.activeClientId,
+          localVersion,
+          localHash,
+          localChanged,
+          localContent: localChanged ? localContent : void 0
         }));
       };
       this.fileSocket.onmessage = async (event) => {
-        var _a, _b;
+        var _a, _b, _c, _d;
         const msg = JSON.parse(event.data);
         if (msg.clientId === this.activeClientId && msg.type !== "ack") return;
         if (msg.type === "text_change") {
@@ -410,14 +438,29 @@ var SyncPlugin = class extends import_obsidian.Plugin {
           if (cm) {
             try {
               const changeSet = import_state.ChangeSet.fromJSON(msg.changes);
+              const docLength = cm.state.doc.length;
+              if (changeSet.length !== docLength) {
+                console.warn(`CyberSync: Document length mismatch (local=${docLength}, expected=${changeSet.length}). Requesting full sync.`);
+                (_a = this.fileSocket) == null ? void 0 : _a.send(JSON.stringify({
+                  type: "request_full_sync",
+                  clientId: this.activeClientId
+                }));
+                return;
+              }
               cm.dispatch({
                 changes: changeSet,
                 annotations: [RemoteUpdate.of(true)]
               });
               this.settings.fileVersions[filepath] = msg.version;
+              const newContent = cm.state.doc.toString();
+              this.settings.lastSyncedHash[filepath] = this.hashString(newContent);
               await this.saveSettings();
             } catch (e) {
               console.error("CyberSync: Failed to apply patches", e);
+              (_b = this.fileSocket) == null ? void 0 : _b.send(JSON.stringify({
+                type: "request_full_sync",
+                clientId: this.activeClientId
+              }));
             }
           }
         } else if (msg.type === "ack") {
@@ -428,14 +471,33 @@ var SyncPlugin = class extends import_obsidian.Plugin {
           if (file && file.path === filepath) {
             const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
             if (view) {
-              view.editor.setValue(msg.content);
+              if (msg.conflict) {
+                const localContent = view.editor.getValue();
+                const serverContent = msg.content;
+                const mergedContent = `server
+---
+${serverContent}
+---
+
+local
+---
+${localContent}
+---`;
+                view.editor.setValue(mergedContent);
+                new import_obsidian.Notice("\u26A0\uFE0F CyberSync: Conflict detected! Please resolve manually.", 8e3);
+                console.warn(`CyberSync: Conflict - merged with markers`);
+              } else {
+                view.editor.setValue(msg.content);
+                console.log(`CyberSync: Full sync applied, version=${msg.version}`);
+              }
               this.settings.fileVersions[filepath] = msg.version;
+              this.settings.lastSyncedHash[filepath] = this.hashString(view.editor.getValue());
               await this.saveSettings();
             }
           }
         } else if (msg.type === "cursor") {
           const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
-          const cm = (_a = view == null ? void 0 : view.editor) == null ? void 0 : _a.cm;
+          const cm = (_c = view == null ? void 0 : view.editor) == null ? void 0 : _c.cm;
           if (cm) {
             cm.dispatch({
               effects: updateCursorEffect.of({
@@ -447,7 +509,7 @@ var SyncPlugin = class extends import_obsidian.Plugin {
           }
         } else if (msg.type === "disconnect") {
           const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
-          const cm = (_b = view == null ? void 0 : view.editor) == null ? void 0 : _b.cm;
+          const cm = (_d = view == null ? void 0 : view.editor) == null ? void 0 : _d.cm;
           if (cm) {
             cm.dispatch({
               effects: removeCursorEffect.of(msg.clientId)

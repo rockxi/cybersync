@@ -30,12 +30,14 @@ interface CyberSyncSettings {
     serverUrl: string;
     clientId: string;
     fileVersions: Record<string, number>;
+    lastSyncedHash: Record<string, string>; // Хеш последнего синхронизированного состояния
 }
 
 const DEFAULT_SETTINGS: CyberSyncSettings = {
     serverUrl: "ws://localhost:8000",
     clientId: "",
     fileVersions: {},
+    lastSyncedHash: {},
 };
 
 const RemoteUpdate = Annotation.define<boolean>();
@@ -120,6 +122,17 @@ export default class SyncPlugin extends Plugin {
 
     private isApplyingRemoteVaultAction = false;
 
+    // Простая функция хеширования
+    private hashString(str: string): string {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash;
+        }
+        return hash.toString(36);
+    }
+
     async onload() {
         console.log("CyberSync: Plugin Loading...");
         await this.loadSettings();
@@ -162,6 +175,13 @@ export default class SyncPlugin extends Plugin {
                     changes: update.changes.toJSON(),
                     clientId: pluginInstance.activeClientId,
                 }));
+                
+                // Обновить хеш после локального изменения
+                const activeFile = pluginInstance.app.workspace.getActiveFile();
+                if (activeFile) {
+                    const newContent = update.state.doc.toString();
+                    pluginInstance.settings.lastSyncedHash[activeFile.path] = pluginInstance.hashString(newContent);
+                }
             }
 
             if (update.selectionSet) {
@@ -447,14 +467,31 @@ export default class SyncPlugin extends Plugin {
          try {
              this.fileSocket = new WebSocket(url);
 
-            this.fileSocket.onopen = () => {
+            this.fileSocket.onopen = async () => {
                 console.log("CyberSync: File Connected:", filepath);
                 this.updateStatusBar("connected");
 
-                // Запросить полную синхронизацию
+                // Получить текущее локальное содержимое
+                const file = this.app.workspace.getActiveFile();
+                if (!file || file.path !== filepath) return;
+                
+                const localContent = await this.app.vault.read(file);
+                const localHash = this.hashString(localContent);
+                const lastSyncedHash = this.settings.lastSyncedHash[filepath];
+                const localVersion = this.settings.fileVersions[filepath] || 0;
+                
+                const localChanged = lastSyncedHash !== undefined && localHash !== lastSyncedHash;
+                
+                console.log(`CyberSync: Sync check - localChanged=${localChanged}, localHash=${localHash}, lastSyncedHash=${lastSyncedHash}`);
+                
+                // Запросить снепшот с сервера с информацией о локальных изменениях
                 this.fileSocket.send(JSON.stringify({
-                    type: "request_full_sync",
-                    clientId: this.activeClientId
+                    type: "sync_request",
+                    clientId: this.activeClientId,
+                    localVersion: localVersion,
+                    localHash: localHash,
+                    localChanged: localChanged,
+                    localContent: localChanged ? localContent : undefined
                 }));
             };
 
@@ -474,15 +511,35 @@ export default class SyncPlugin extends Plugin {
                      if (cm) {
                          try {
                              const changeSet = ChangeSet.fromJSON(msg.changes);
+                             
+                             // Проверить что длина документа подходит для применения патча
+                             const docLength = cm.state.doc.length;
+                             if (changeSet.length !== docLength) {
+                                 console.warn(`CyberSync: Document length mismatch (local=${docLength}, expected=${changeSet.length}). Requesting full sync.`);
+                                 this.fileSocket?.send(JSON.stringify({
+                                     type: "request_full_sync",
+                                     clientId: this.activeClientId
+                                 }));
+                                 return;
+                             }
+                             
                              cm.dispatch({
                                  changes: changeSet,
                                  annotations: [RemoteUpdate.of(true)]
                              });
 
                              this.settings.fileVersions[filepath] = msg.version;
+                             // Обновить хеш после применения патча
+                             const newContent = cm.state.doc.toString();
+                             this.settings.lastSyncedHash[filepath] = this.hashString(newContent);
                              await this.saveSettings();
                          } catch (e) {
                              console.error("CyberSync: Failed to apply patches", e);
+                             // При ошибке применения патча запросить полную синхронизацию
+                             this.fileSocket?.send(JSON.stringify({
+                                 type: "request_full_sync",
+                                 clientId: this.activeClientId
+                             }));
                          }
                      }
                  }
@@ -495,8 +552,25 @@ export default class SyncPlugin extends Plugin {
                      if (file && file.path === filepath) {
                          const view = this.app.workspace.getActiveViewOfType(MarkdownView);
                          if (view) {
-                             view.editor.setValue(msg.content);
+                             if (msg.conflict) {
+                                 // Конфликт: сделать merge с маркерами
+                                 const localContent = view.editor.getValue();
+                                 const serverContent = msg.content;
+                                 
+                                 const mergedContent = 
+                                     `server\n---\n${serverContent}\n---\n\n` +
+                                     `local\n---\n${localContent}\n---`;
+                                 
+                                 view.editor.setValue(mergedContent);
+                                 new Notice("⚠️ CyberSync: Conflict detected! Please resolve manually.", 8000);
+                                 console.warn(`CyberSync: Conflict - merged with markers`);
+                             } else {
+                                 view.editor.setValue(msg.content);
+                                 console.log(`CyberSync: Full sync applied, version=${msg.version}`);
+                             }
+                             
                              this.settings.fileVersions[filepath] = msg.version;
+                             this.settings.lastSyncedHash[filepath] = this.hashString(view.editor.getValue());
                              await this.saveSettings();
                          }
                      }

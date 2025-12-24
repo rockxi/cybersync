@@ -515,11 +515,10 @@ export default class SyncPlugin extends Plugin {
                              // Проверить что длина документа подходит для применения патча
                              const docLength = cm.state.doc.length;
                              if (changeSet.length !== docLength) {
-                                 console.warn(`CyberSync: Document length mismatch (local=${docLength}, expected=${changeSet.length}). Requesting full sync.`);
-                                 this.fileSocket?.send(JSON.stringify({
-                                     type: "request_full_sync",
-                                     clientId: this.activeClientId
-                                 }));
+                                 console.warn(`CyberSync: Document length mismatch (local=${docLength}, expected=${changeSet.length}). Reconnecting to resolve conflict.`);
+                                 // Переподключиться чтобы запустить sync_request заново
+                                 this.fileSocket?.close();
+                                 setTimeout(() => this.connectFileSocket(filepath), 500);
                                  return;
                              }
                              
@@ -535,11 +534,9 @@ export default class SyncPlugin extends Plugin {
                              await this.saveSettings();
                          } catch (e) {
                              console.error("CyberSync: Failed to apply patches", e);
-                             // При ошибке применения патча запросить полную синхронизацию
-                             this.fileSocket?.send(JSON.stringify({
-                                 type: "request_full_sync",
-                                 clientId: this.activeClientId
-                             }));
+                             // При ошибке применения патча переподключиться
+                             this.fileSocket?.close();
+                             setTimeout(() => this.connectFileSocket(filepath), 500);
                          }
                      }
                  }

@@ -440,11 +440,9 @@ var SyncPlugin = class extends import_obsidian.Plugin {
               const changeSet = import_state.ChangeSet.fromJSON(msg.changes);
               const docLength = cm.state.doc.length;
               if (changeSet.length !== docLength) {
-                console.warn(`CyberSync: Document length mismatch (local=${docLength}, expected=${changeSet.length}). Requesting full sync.`);
-                (_a = this.fileSocket) == null ? void 0 : _a.send(JSON.stringify({
-                  type: "request_full_sync",
-                  clientId: this.activeClientId
-                }));
+                console.warn(`CyberSync: Document length mismatch (local=${docLength}, expected=${changeSet.length}). Reconnecting to resolve conflict.`);
+                (_a = this.fileSocket) == null ? void 0 : _a.close();
+                setTimeout(() => this.connectFileSocket(filepath), 500);
                 return;
               }
               cm.dispatch({
@@ -457,10 +455,8 @@ var SyncPlugin = class extends import_obsidian.Plugin {
               await this.saveSettings();
             } catch (e) {
               console.error("CyberSync: Failed to apply patches", e);
-              (_b = this.fileSocket) == null ? void 0 : _b.send(JSON.stringify({
-                type: "request_full_sync",
-                clientId: this.activeClientId
-              }));
+              (_b = this.fileSocket) == null ? void 0 : _b.close();
+              setTimeout(() => this.connectFileSocket(filepath), 500);
             }
           }
         } else if (msg.type === "ack") {

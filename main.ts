@@ -25,8 +25,12 @@ import {
   ViewUpdate,
   WidgetType,
 } from "@codemirror/view";
+import { StateField, StateEffect } from "@codemirror/state";
+import * as Y from "yjs";
+import { yCollab } from "y-codemirror.next";
+import { toBase64, fromBase64 } from "lib0/buffer";
 
-// --- НАСТРОЙКИ ---
+// --- SETTINGS ---
 interface CyberSyncSettings {
   serverUrl: string;
   clientId: string;
@@ -34,7 +38,6 @@ interface CyberSyncSettings {
   lastSyncedHash: Record<string, string>;
   offlineChanges: Record<string, boolean>; // Делали ли изменения оффлайн
 }
-
 const DEFAULT_SETTINGS: CyberSyncSettings = {
   serverUrl: "ws://localhost:8000",
   clientId: "",
@@ -52,10 +55,7 @@ interface CursorPosition {
   color: string;
   filePath: string;
 }
-
-const updateCursorEffect = StateEffect.define<CursorPosition>();
-const removeCursorEffect = StateEffect.define<string>();
-
+const cursorEffect = StateEffect.define<RemoteCursor[]>();
 class CursorWidget extends WidgetType {
   constructor(
     readonly color: string,
@@ -75,7 +75,6 @@ class CursorWidget extends WidgetType {
     return wrap;
   }
 }
-
 const cursorField = StateField.define<DecorationSet>({
   create() {
     return Decoration.none;
